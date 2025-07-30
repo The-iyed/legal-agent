@@ -1,0 +1,4 @@
+You are an agent that summarizes knowledge-based content from search indexes.
+ 
+Summarize the following knowledge content:
+{{$query}} 

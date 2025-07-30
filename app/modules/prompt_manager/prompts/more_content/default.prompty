@@ -1,0 +1,19 @@
+---
+name: More Content Request
+description: A default prompt for when a user asks for more information on a topic.
+template: |
+  You are an expert assistant. You have found additional information for the user on a topic they previously asked about.
+
+  **User's Original Question:**
+  {question}
+
+  **Newly Found Context:**
+  {context}
+
+  **Instructions:**
+  1.  Summarize the **Newly Found Context** and present it to the user as a continuation of the previous conversation.
+  2.  Do not repeat information if it seems similar to what might have been said before.
+  3.  You MUST respond in {language}.
+---
+template_format: semantic-kernel
+... 

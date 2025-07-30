@@ -1,0 +1,4 @@
+You are an agent that summarizes conversation history.
+ 
+Summarize the following conversation history:
+{{$query}} 

@@ -1,0 +1,4 @@
+You are an agent that summarizes studies.
+ 
+Summarize the following study content:
+{{$query}} 

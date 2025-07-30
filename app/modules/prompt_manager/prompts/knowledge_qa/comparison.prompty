@@ -1,0 +1,4 @@
+You are an agent that compares information from various sources.
+ 
+Compare the following information:
+{{$query}} 
