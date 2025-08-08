@@ -30,8 +30,37 @@
       "field_value": "عبير أحمد سعيد العمودي",
       "confidence": 0.95,
       "page_number": 1,
-      "bounding_box": null,
       "field_type": "text",
+      "is_required": true,
+      "validation_rules": null
+    },
+    {
+      "field_name": "plaintiff_occupation",
+      "field_name_arabic": "المهنة",
+      "field_value": "بدون عمل",
+      "confidence": 0.9,
+      "page_number": 1,
+      "field_type": "text",
+      "is_required": false,
+      "validation_rules": null
+    },
+    {
+      "field_name": "plaintiff_nationality",
+      "field_name_arabic": "الجنسية",
+      "field_value": "سعودي",
+      "confidence": 0.9,
+      "page_number": 1,
+      "field_type": "text",
+      "is_required": true,
+      "validation_rules": null
+    },
+    {
+      "field_name": "national_id",
+      "field_name_arabic": "رقم الهوية",
+      "field_value": "١١١٠٢٢٥١٨٠",
+      "confidence": 0.9,
+      "page_number": 1,
+      "field_type": "number",
       "is_required": true,
       "validation_rules": null
     },
@@ -41,7 +70,26 @@
       "field_value": "أمانة منطقة الرياض",
       "confidence": 0.95,
       "page_number": 1,
-      "bounding_box": null,
+      "field_type": "text",
+      "is_required": true,
+      "validation_rules": null
+    },
+    {
+      "field_name": "defendant_type",
+      "field_name_arabic": "نوع المدعى عليه",
+      "field_value": "جهة حكومية",
+      "confidence": 0.95,
+      "page_number": 1,
+      "field_type": "text",
+      "is_required": true,
+      "validation_rules": null
+    },
+    {
+      "field_name": "plaintiff_type",
+      "field_name_arabic": "نوع المدعي",
+      "field_value": "فرد",
+      "confidence": 0.95,
+      "page_number": 1,
       "field_type": "text",
       "is_required": true,
       "validation_rules": null
@@ -52,7 +100,6 @@
       "field_value": "اعتراض على مخالفة تقديم الشيشة دون تصريح",
       "confidence": 0.95,
       "page_number": 1,
-      "bounding_box": null,
       "field_type": "text",
       "is_required": true,
       "validation_rules": null
@@ -63,7 +110,6 @@
       "field_value": "المحكمة الإدارية بالرياض",
       "confidence": 0.95,
       "page_number": 1,
-      "bounding_box": null,
       "field_type": "text",
       "is_required": true,
       "validation_rules": null
@@ -74,7 +120,6 @@
       "field_value": "غير مذكورة",
       "confidence": 0.85,
       "page_number": 1,
-      "bounding_box": null,
       "field_type": "text",
       "is_required": false,
       "validation_rules": null
@@ -85,9 +130,28 @@
       "field_value": "طلب إلغاء مخالفة رقم ١٠٠٠٠٠٠٣٦٥٧٨٤٦ بسبب تقديم الشيشة دون تصريح",
       "confidence": 0.95,
       "page_number": 1,
-      "bounding_box": null,
       "field_type": "text",
       "is_required": true,
+      "validation_rules": null
+    },
+    {
+      "field_name": "subject",
+      "field_name_arabic": "الموضوع",
+      "field_value": "أنا صاحبة مقهئ وردة العرب لتقديم المشروبات (٤ اونس كافية ديزير)، سجل تجاري رقم ١٠١٠٤٥٢٣٥٥",
+      "confidence": 0.95,
+      "page_number": 1,
+      "field_type": "text",
+      "is_required": false,
+      "validation_rules": null
+    },
+    {
+      "field_name": "attachments",
+      "field_name_arabic": "الاسانيد",
+      "field_value": "هوية المدعية سجل التجاري صورة المخالفة صورة رفض الاعتراض رقم الاصدار ٢ تاريخ الاصدار ١٤٣٩",
+      "confidence": 0.95,
+      "page_number": 1,
+      "field_type": "text",
+      "is_required": false,
       "validation_rules": null
     },
     {
@@ -96,7 +160,6 @@
       "field_value": "غير مذكور",
       "confidence": 0.85,
       "page_number": 1,
-      "bounding_box": null,
       "field_type": "text",
       "is_required": false,
       "validation_rules": null
@@ -107,9 +170,18 @@
       "field_value": "٠٥٤٨٠٠٦٧٠٠",
       "confidence": 0.95,
       "page_number": 1,
-      "bounding_box": null,
       "field_type": "phone",
       "is_required": true,
+      "validation_rules": null
+    },
+    {
+      "field_name": "email",
+      "field_name_arabic": "البريد الإلكتروني",
+      "field_value": "maabeer٣@gmail.com",
+      "confidence": 0.95,
+      "page_number": 1,
+      "field_type": "email",
+      "is_required": false,
       "validation_rules": null
     },
     {
@@ -118,20 +190,8 @@
       "field_value": "رقم المبني ٢٩٧١، شارع سعيد بن عامر، وحدة رقم ١، الرياض، الرمز البريدي ١٢٣٩٥، الرمز الإضافي ٧١٧٤",
       "confidence": 0.95,
       "page_number": 1,
-      "bounding_box": null,
       "field_type": "text",
       "is_required": true,
-      "validation_rules": null
-    },
-    {
-      "field_name": "email",
-      "field_name_arabic": "البريد الإلكتروني",
-      "field_value": "maabeer@gmail.com",
-      "confidence": 0.95,
-      "page_number": 1,
-      "bounding_box": null,
-      "field_type": "email",
-      "is_required": false,
       "validation_rules": null
     },
     {
@@ -140,7 +200,6 @@
       "field_value": "١٠١٠٤٥٢٣٥٥",
       "confidence": 0.95,
       "page_number": 1,
-      "bounding_box": null,
       "field_type": "number",
       "is_required": false,
       "validation_rules": null
@@ -151,9 +210,8 @@
       "field_value": "١٠٠٠٠٠٠٣٦٥٧٨٤٦",
       "confidence": 0.95,
       "page_number": 1,
-      "bounding_box": null,
       "field_type": "number",
-      "is_required": false,
+      "is_required": true,
       "validation_rules": null
     },
     {
@@ -162,9 +220,68 @@
       "field_value": "٣٨٠٥٤٨٢",
       "confidence": 0.95,
       "page_number": 1,
-      "bounding_box": null,
+      "field_type": "number",
+      "is_required": true,
+      "validation_rules": null
+    },
+    {
+      "field_name": "reference_code",
+      "field_name_arabic": "الكود المرجعي",
+      "field_value": "٢٣١٧٧٠٧",
+      "confidence": 0.95,
+      "page_number": 1,
       "field_type": "number",
       "is_required": false,
+      "validation_rules": null
+    },
+    {
+      "field_name": "issue_number",
+      "field_name_arabic": "رقم الاصدار",
+      "field_value": "٢",
+      "confidence": 0.9,
+      "page_number": 1,
+      "field_type": "number",
+      "is_required": false,
+      "validation_rules": null
+    },
+    {
+      "field_name": "issue_date",
+      "field_name_arabic": "تاريخ الاصدار",
+      "field_value": "١٤٣٩",
+      "confidence": 0.9,
+      "page_number": 1,
+      "field_type": "date",
+      "is_required": false,
+      "validation_rules": null
+    },
+    {
+      "field_name": "report_time",
+      "field_name_arabic": "الوقت",
+      "field_value": "٠١:٢٧ م",
+      "confidence": 0.9,
+      "page_number": 1,
+      "field_type": "time",
+      "is_required": false,
+      "validation_rules": null
+    },
+    {
+      "field_name": "notification_method",
+      "field_name_arabic": "طريقة إبلاغ المدعى عليه",
+      "field_value": "الإبلاغ عن طريق المحكمة",
+      "confidence": 0.95,
+      "page_number": 3,
+      "field_type": "text",
+      "is_required": true,
+      "validation_rules": null
+    },
+    {
+      "field_name": "court_notice_platform",
+      "field_name_arabic": "منصة التبليغ",
+      "field_value": "منصة معين",
+      "confidence": 0.85,
+      "page_number": 2,
+      "field_type": "text",
+      "is_required": true,
       "validation_rules": null
     }
   ],

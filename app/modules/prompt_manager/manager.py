@@ -86,6 +86,12 @@ class PromptManager:
         """
         return self.prompts.get(agent_type, {}).get(prompt_type)
     
+    def reload_prompts(self):
+        """Force reload all prompts from disk."""
+        self.prompts = {}
+        self._load_prompts()
+        print("Prompts reloaded successfully")
+    
     def get_agent_prompts(self, agent_type: str) -> Dict[str, str]:
         """
         Get all prompts for an agent.

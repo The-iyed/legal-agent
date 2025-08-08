@@ -12,6 +12,7 @@ from typing import Optional, Any
 from pydantic import BaseModel, ConfigDict
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.routes.message import get_message_service
+from app.schemas.conversation import ConversationStatus
 
 logger = logging.getLogger(__name__)
 
@@ -228,6 +229,126 @@ async def upload_file(
             detail=f"Failed to process file: {str(e)}"
         )
 
+@router.post(
+    "/upload-attachments",
+    response_model=FileUploadResponse,
+    summary="Upload supporting attachments for a validated claim",
+    description="""
+    Upload supporting documents and attachments for a validated statement of claim.
+    
+    This endpoint:
+    1. Validates that the conversation exists and is in WAITING_FOR_ATTACHMENTS status
+    2. Uploads multiple attachment files to Azure Blob Storage
+    3. Extracts content from each attachment using Azure Document Intelligence
+    4. Stores the processed attachments in the database
+    5. Returns a comprehensive overview of the claim with all attachments
+    
+    Required fields:
+    - conversation_id: ID of the conversation (must be a valid MongoDB ObjectId)
+    - user_id: ID of the user uploading the attachments
+    - files: List of attachment files to upload (PDF, image, etc.)
+    
+    Returns:
+    - response: Arabic response with full claim overview including attachments
+    - file_url: URLs of uploaded attachment files
+    - case_number: Extracted case number from the original claim
+    - is_valid: Whether the attachments were processed successfully
+    - metadata: Additional processing information including attachment summaries
+    """
+)
+async def upload_attachments(
+    conversation_id: str = Form(..., description="Conversation ID"),
+    user_id: str = Form(..., description="User ID"),
+    files: list[UploadFile] = File(..., description="Attachment files to upload"),
+    agent_service: AgentService = Depends(get_agent_service),
+    conversation_service: ConversationService = Depends(get_conversation_service)
+):
+    """
+    Upload and process supporting attachments for a validated claim.
+    
+    Args:
+        conversation_id: The conversation ID to associate the attachments with
+        user_id: The user ID uploading the attachments
+        files: List of attachment files to upload and process
+        agent_service: Service for processing files and generating responses
+        conversation_service: Service for managing conversations
+        
+    Returns:
+        FileUploadResponse: Processing results and comprehensive claim overview
+        
+    Raises:
+        HTTPException: 
+            - 400: If the conversation_id is invalid or conversation is in wrong status
+            - 404: If the conversation doesn't exist
+            - 500: If there's an error processing the attachments
+    """
+    try:
+        # Validate conversation_id format
+        if not ObjectId.is_valid(conversation_id):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid conversation ID format"
+            )
+
+        # Verify conversation exists and is in correct status
+        conversation = await conversation_service.get_conversation(conversation_id)
+        if conversation is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Conversation not found"
+            )
+        
+        if conversation.status != "waiting_for_attachments":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Conversation must be in 'waiting_for_attachments' status. Current status: {conversation.status}"
+            )
+
+        # Validate files
+        if not files or len(files) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No files provided"
+            )
+
+        # Check total file size (limit to 50MB for multiple files)
+        total_size = 0
+        for file in files:
+            file_content = await file.read()
+            total_size += len(file_content)
+            # Reset file position for later processing
+            await file.seek(0)
+            
+        if total_size > 50 * 1024 * 1024:  # 50MB
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Total file size too large. Maximum size is 50MB for all attachments."
+            )
+
+        # Process attachments
+        attachment_results = await agent_service.process_attachments(
+            files=files,
+            conversation_id=conversation_id,
+            user_id=user_id
+        )
+
+        # Update conversation status to claim_docs_discussion
+        await conversation_service.update_conversation_status(
+            conversation_id, 
+            ConversationStatus.CLAIM_DOCS_DISCUSSION
+        )
+
+        return attachment_results
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading attachments: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to process attachments: {str(e)}"
+        )
+
 @router.get(
     "/statement-of-claim/{conversation_id}",
     summary="Get statement of claim data for a conversation",
@@ -441,4 +562,63 @@ async def download_file(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to download file: {str(e)}"
+        )
+
+@router.post(
+    "/reload-prompts",
+    summary="Force reload all prompts",
+    description="""
+    Force reload all prompts from disk to pick up any changes.
+    
+    This endpoint is useful for development and testing when prompt files have been modified.
+    
+    Returns:
+    - Success message indicating prompts have been reloaded
+    """
+)
+async def reload_prompts(
+    agent_service: AgentService = Depends(get_agent_service)
+):
+    """
+    Force reload all prompts.
+    
+    Args:
+        agent_service: Service for managing prompts
+        
+    Returns:
+        Success message
+        
+    Raises:
+        HTTPException: 
+            - 500: If there's an error reloading the prompts
+    """
+    try:
+        agent_service.reload_prompts()
+        return {"message": "Prompts reloaded successfully"}
+        
+    except Exception as e:
+        logger.error(f"Error reloading prompts: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to reload prompts: {str(e)}"
         ) 
+
+@router.get(
+    "/attachments/{conversation_id}/overview",
+    summary="Generate human lawyer-style attachments overview",
+    description="Build a grounded overview of attachments and their purpose using full claim text and attachments content."
+)
+async def attachments_overview(
+    conversation_id: str,
+):
+    from bson import ObjectId
+    if not ObjectId.is_valid(conversation_id):
+        raise HTTPException(status_code=400, detail="Invalid conversation ID format")
+    try:
+        from app.modules.attachments.service import AttachmentsAnalysisService
+        svc = AttachmentsAnalysisService()
+        content = await svc.generate_attachments_overview(conversation_id)
+        return {"status": "success", "content": content}
+    except Exception as e:
+        logger.error(f"attachments_overview error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate attachments overview") 

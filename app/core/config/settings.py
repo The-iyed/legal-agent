@@ -23,6 +23,12 @@ class Settings(BaseSettings):
     MONGODB_URL: str = "mongodb://mongodb:27017"  # Hardcoded for Docker
     MONGODB_DB_NAME: str = "tachriat_agent"  # Hardcoded
     
+    # Redis Configuration
+    REDIS_URL: str = Field(
+        default=os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+        description="Redis connection URL"
+    )
+    
     # Azure OpenAI Configuration
     AZURE_OPENAI_DEPLOYMENT_NAME: str = Field(
         default=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", ""),
@@ -36,9 +42,19 @@ class Settings(BaseSettings):
         default=os.getenv("AZURE_OPENAI_API_KEY", ""),
         description="Azure OpenAI API key"
     )
+    AZURE_OPENAI_API_VERSION: str = Field(
+        default=os.getenv("AZURE_OPENAI_API_VERSION", "2024-11-20"),
+        description="Azure OpenAI API version"
+    )
     AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME: str = Field(
         default=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME", ""),
         description="Azure OpenAI embedding deployment name"
+    )
+    
+    # OpenAI Configuration (for direct OpenAI API)
+    OPENAI_API_KEY: str = Field(
+        default=os.getenv("OPENAI_API_KEY", ""),
+        description="OpenAI API key for direct OpenAI API calls"
     )
     
     # Azure AI Search Configuration
@@ -55,14 +71,24 @@ class Settings(BaseSettings):
         description="Azure AI Search index name for the Study Agent"
     )
     
-    # Azure AI Search Configuration
-    AZURE_AI_SEARCH_ENDPOINT: str = Field(
-        default=os.getenv("AZURE_AI_SEARCH_ENDPOINT", ""),
-        description="Azure AI Search endpoint URL"
+    # Azure Document Intelligence Configuration
+    AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT: str = Field(
+        default=os.getenv("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", ""),
+        description="Azure Document Intelligence endpoint URL"
     )
-    AZURE_AI_SEARCH_API_KEY: str = Field(
-        default=os.getenv("AZURE_AI_SEARCH_API_KEY", ""),
-        description="Azure AI Search API key"
+    AZURE_DOCUMENT_INTELLIGENCE_API_KEY: str = Field(
+        default=os.getenv("AZURE_DOCUMENT_INTELLIGENCE_KEY", ""),  # Note: env var is KEY, not API_KEY
+        description="Azure Document Intelligence API key"
+    )
+    
+    # Azure Storage Configuration
+    AZURE_STORAGE_CONNECTION_STRING: str = Field(
+        default=os.getenv("AZURE_STORAGE_CONNECTION_STRING", ""),
+        description="Azure Storage connection string"
+    )
+    AZURE_STORAGE_CONTAINER_NAME: str = Field(
+        default=os.getenv("AZURE_STORAGE_CONTAINER_NAME", "leg-files"),
+        description="Azure Storage container name"
     )
     
     # Application Configuration
@@ -86,6 +112,7 @@ class Settings(BaseSettings):
         super().__init__(**kwargs)
         logger.info(f"Initialized Settings with MONGODB_URL: {self.MONGODB_URL}")
         logger.info(f"Initialized Settings with MONGODB_DB_NAME: {self.MONGODB_DB_NAME}")
+        logger.info(f"Initialized Settings with REDIS_URL: {self.REDIS_URL}")
 
 # Create a global settings instance
 settings = Settings()

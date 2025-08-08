@@ -10,6 +10,16 @@ services:
     networks:
       - app-network
 
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - app-network
+
   tachriat-app:
     build: .
     ports:
@@ -17,12 +27,11 @@ services:
     environment:
       - MONGODB_URL=mongodb://mongodb:27017/maarefa_agent
       - MONGODB_DB_NAME=maarefa_agent
-      - AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT=https://momah-docai-westeurope.cognitiveservices.azure.com/
-      - AZURE_DOCUMENT_INTELLIGENCE_API_KEY=DTpywr9ybH8yx2uJc0tug3iUuWxKslDA0mGltS0z29qLBpoxlDzFJQQJ99BEAC5RqLJXJ3w3AAALACOGuSSr
-      - AZURE_STORAGE_CONTAINER_NAME=leg-files
       - EMBEDDING_MODEL_TYPE=azure_openai
+      - REDIS_URL=redis://redis:6379/0
     depends_on:
       - mongodb
+      - redis
     networks:
       - app-network
     volumes:
@@ -34,4 +43,5 @@ networks:
     driver: bridge
 
 volumes:
-  mongodb_data: 
+  mongodb_data:
+  redis_data: 

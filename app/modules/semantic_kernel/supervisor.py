@@ -87,15 +87,42 @@ class Supervisor:
             logger.error(f"Error during query analysis: {str(e)}")
             raise ValueError(f"Error during query analysis: {str(e)}")
     
-    async def route_query(self, query: str, context: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    async def route_query(self, query: str, context: Optional[List[Dict[str, Any]]] = None, system_prompt: Optional[str] = None, conversation_status: Optional[str] = None) -> Dict[str, Any]:
         try:
             logger.info(f"Routing query: {query[:100]}...")
-            # First analysis with all agents
-            analysis = await self.analyze_query(query, context)
-            agent_type = analysis["agent_type"]
-            confidence = float(analysis["confidence"])
-            reasoning = analysis["reasoning"]
-            prompt_type = analysis["prompt_type"]
+            
+            # Check if conversation status is "waiting_for_claim" - automatically route to chat agent
+            if conversation_status == "waiting_for_claim":
+                logger.info("Conversation status is 'waiting_for_claim' - automatically routing to chat agent without LLM analysis")
+                agent_type = "chat"
+                confidence = 1.0
+                reasoning = "Automatic routing due to waiting_for_claim status"
+                prompt_type = "waiting_for_claim"
+            elif conversation_status == "waiting_for_attachments":
+                logger.info("Conversation status is 'waiting_for_attachments' - automatically routing to chat agent without LLM analysis")
+                agent_type = "chat"
+                confidence = 1.0
+                reasoning = "Automatic routing due to waiting_for_attachments status"
+                prompt_type = "waiting_for_attachments"
+            elif conversation_status == "claim_discussion":
+                logger.info("Conversation status is 'claim_discussion' - routing to chat agent with claim discussion prompt")
+                agent_type = "chat"
+                confidence = 1.0
+                reasoning = "Automatic routing due to claim_discussion status"
+                prompt_type = "claim_discussion"
+            elif conversation_status == "claim_docs_discussion":
+                logger.info("Conversation status is 'claim_docs_discussion' - routing to chat agent with claim_docs_discussion prompt")
+                agent_type = "chat"
+                confidence = 1.0
+                reasoning = "Automatic routing due to claim_docs_discussion status"
+                prompt_type = "claim_docs_discussion"
+            else:
+                # First analysis with all agents
+                analysis = await self.analyze_query(query, context)
+                agent_type = analysis["agent_type"]
+                confidence = float(analysis["confidence"])
+                reasoning = analysis["reasoning"]
+                prompt_type = analysis["prompt_type"]
 
             # If the chosen agent is the context reformulator, run it ONCE
             if agent_type == "context_reformulator":
@@ -165,19 +192,80 @@ class Supervisor:
                     "reasoning": "Failed to find appropriate agent"
                 }
             
-            # Get the actual prompt text from the PromptManager
-            prompt = self.prompt_manager.get_prompt(agent_type, prompt_type)
-            if not prompt:
-                logger.error(f"Prompt not found for agent_type '{agent_type}' and prompt_type '{prompt_type}'")
-                return {
-                    "agent_type": agent_type,
-                    "prompt_type": prompt_type,
-                    "confidence": 0.0,
-                    "response": None,
-                    "error": f"Prompt not found for agent_type '{agent_type}' and prompt_type '{prompt_type}'",
-                    "reasoning": "Failed to find appropriate prompt"
-                }
+            # Get the actual prompt text from the PromptManager or use provided system_prompt
+            if system_prompt:
+                prompt = system_prompt
+                logger.info("Using provided system prompt for agent execution")
+            else:
+                prompt = self.prompt_manager.get_prompt(agent_type, prompt_type)
+                if not prompt:
+                    logger.error(f"Prompt not found for agent_type '{agent_type}' and prompt_type '{prompt_type}'")
+                    return {
+                        "agent_type": agent_type,
+                        "prompt_type": prompt_type,
+                        "confidence": 0.0,
+                        "response": None,
+                        "error": f"Prompt not found for agent_type '{agent_type}' and prompt_type '{prompt_type}'",
+                        "reasoning": "Failed to find appropriate prompt"
+                    }
+
+            # Inject claim raw text into claim_discussion prompt if available
+            if prompt_type == "claim_discussion":
+                try:
+                    from app.core.database import get_database
+                    db = get_database()
+                    conv_id = None
+                    # Try to extract conversation_id from context messages metadata
+                    if context:
+                        for msg in context:
+                            cid = msg.get("conversation_id") or msg.get("message_data", {}).get("conversation_id")
+                            if cid:
+                                conv_id = cid
+                                break
+                    # Fallback: try last message ref
+                    if not conv_id and context and len(context) > 0:
+                        conv_id = context[-1].get("conversation_id")
+                    if conv_id:
+                        doc = await db.statement_of_claim.find_one({"conversation_id": conv_id})
+                        raw_text = (doc or {}).get("raw_text")
+                        if raw_text:
+                            prompt = prompt.replace("{{RAW_CLAIM_TEXT}}", raw_text)
+                        else:
+                            prompt = prompt.replace("{{RAW_CLAIM_TEXT}}", "(لا يوجد نص مستخرج محفوظ لهذه القضية حتى الآن)")
+                    else:
+                        prompt = prompt.replace("{{RAW_CLAIM_TEXT}}", "(يتعذر تحديد المحادثة لاستخراج النص)")
+                except Exception as e:
+                    logger.warning(f"Could not inject RAW_CLAIM_TEXT into claim_discussion prompt: {e}")
+                    prompt = prompt.replace("{{RAW_CLAIM_TEXT}}", "(تعذر تحميل نص الدعوى المحفوظ)")
             
+            # For claim_docs_discussion, inject attachments raw text
+            if prompt_type == "claim_docs_discussion":
+                try:
+                    from app.core.database import get_database
+                    db = get_database()
+                    conv_id = None
+                    if context:
+                        for msg in context:
+                            cid = msg.get("conversation_id") or msg.get("message_data", {}).get("conversation_id")
+                            if cid:
+                                conv_id = cid
+                                break
+                    if conv_id:
+                        # gather attachments texts
+                        texts = []
+                        cursor = db.attachments.find({"conversation_id": conv_id}).sort("created_at", 1)
+                        async for att in cursor:
+                            t = (att.get("extracted_content", {}) or {}).get("raw_text", "")
+                            if t:
+                                texts.append(t[:2000])
+                        merged = "\n\n---\n".join(texts) if texts else "(لا توجد مرفقات محفوظة)"
+                        prompt = prompt.replace("{{RAW_ATTACHMENTS_TEXT}}", merged)
+                    else:
+                        prompt = prompt.replace("{{RAW_ATTACHMENTS_TEXT}}", "(يتعذر تحديد المحادثة لاستخراج نصوص المرفقات)")
+                except Exception as e:
+                    logger.warning(f"Could not inject RAW_ATTACHMENTS_TEXT: {e}")
+                    prompt = prompt.replace("{{RAW_ATTACHMENTS_TEXT}}", "(تعذر تحميل نصوص المرفقات)")
+
             # Process the query with the selected agent
             agent = agent_class(settings=self.settings)
             logger.info(f"Supervisor: Passing context to agent.execute. Context length: {len(context) if context else 0}")

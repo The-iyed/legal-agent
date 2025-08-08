@@ -4,6 +4,8 @@ from app.routes.conversation import router as conversation_router
 from app.routes.agent import router as agent_router
 from app.routes.message import router as message_router
 from app.routes.admin import router as admin_router
+from app.routes.document_intelligence import router as document_intelligence_router
+from app.routes.claim_extractor import router as claim_extractor_router
 from app.core.database import connect_to_mongo, close_mongo_connection, db_manager
 from app.core.scheduler import task_scheduler
 from contextlib import asynccontextmanager
@@ -66,6 +68,14 @@ app = FastAPI(
         {
             "name": "messages",
             "description": "Message management operations including creating and retrieving messages.",
+        },
+        {
+            "name": "Document Intelligence",
+            "description": "Enhanced document analysis using Azure Document Intelligence with multiple models and specialized legal document processing.",
+        },
+        {
+            "name": "Claim Extractor",
+            "description": "Specialized claim extraction and processing from legal documents with AI-powered refinement and validation.",
         }
     ],
     lifespan=lifespan
@@ -85,6 +95,8 @@ app.include_router(conversation_router, prefix="/api")
 app.include_router(agent_router, prefix="/api")
 app.include_router(message_router, prefix="/api")
 app.include_router(admin_router, prefix="/api")
+app.include_router(document_intelligence_router)
+app.include_router(claim_extractor_router)
 
 @app.get("/", tags=["root"])
 async def root():

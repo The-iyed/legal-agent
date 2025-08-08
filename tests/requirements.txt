@@ -1,0 +1,7 @@
+# Testing dependencies for Legal Agent System
+aiohttp>=3.8.0
+asyncio
+dataclasses
+typing-extensions
+openai>=1.0.0
+pathlib 

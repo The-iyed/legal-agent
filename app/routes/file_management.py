@@ -17,6 +17,7 @@ from app.modules.document_processor.service import DocumentProcessorService
 from app.modules.response_generator.service import ResponseGeneratorService
 from app.modules.conversation.service import ConversationService
 from app.modules.message.service import MessageService
+from app.modules.claim_extractor.service import ClaimExtractorService
 from app.schemas.agent import FileUploadResponse, FileInfoResponse
 from app.schemas.message import MessageCreate
 
@@ -53,6 +54,11 @@ def get_message_service(db: AsyncIOMotorDatabase = Depends(get_database)) -> Mes
     return MessageService(db)
 
 
+def get_claim_extractor_service() -> ClaimExtractorService:
+    """Get claim extractor service instance."""
+    return ClaimExtractorService()
+
+
 @router.post(
     "/upload",
     response_model=FileUploadResponse,
@@ -87,7 +93,8 @@ async def upload_file(
     document_processor: DocumentProcessorService = Depends(get_document_processor_service),
     response_generator: ResponseGeneratorService = Depends(get_response_generator_service),
     conversation_service: ConversationService = Depends(get_conversation_service),
-    message_service: MessageService = Depends(get_message_service)
+    message_service: MessageService = Depends(get_message_service),
+    claim_extractor: ClaimExtractorService = Depends(get_claim_extractor_service)
 ):
     """
     Upload and process a legal document file.
@@ -141,44 +148,64 @@ async def upload_file(
                 detail="File size too large. Maximum size is 10MB."
             )
 
-        # Process document
+        # Process document with enhanced claim extraction
         extracted_data = await document_processor.process_document(
             file_content=file_content,
             filename=file.filename,
             conversation_id=conversation_id
         )
 
-        # Store document data in database
-        await _store_document_data(conversation_id, extracted_data)
+        # Enhanced claim extraction using the new service
+        claim_extraction_result = await claim_extractor.extract_claim_from_pdf(
+            file_content=file_content,
+            filename=file.filename,
+            conversation_id=conversation_id
+        )
+
+        # Merge extracted data with claim extraction results
+        enhanced_data = await _merge_extraction_results(extracted_data, claim_extraction_result)
+
+        # Store enhanced document data in database
+        await _store_document_data(conversation_id, enhanced_data)
 
         # Store user message about file upload
         await _store_file_upload_message(file.filename, conversation_id, user_id, message_service)
 
-        # Generate response
+        # Generate enhanced response using claim extraction results
         context = response_generator.create_response_context(
             conversation_id=conversation_id,
             user_id=user_id,
-            extracted_data=extracted_data,
+            extracted_data=enhanced_data,
             filename=file.filename
         )
-        response_text = response_generator.generate_file_upload_response(context)
+        
+        # Use refined response from claim extraction if available
+        if claim_extraction_result.refined_response:
+            response_text = claim_extraction_result.refined_response
+        else:
+            response_text = response_generator.generate_file_upload_response(context)
 
         # Store agent response
         await _store_agent_response(conversation_id, user_id, response_text, message_service)
 
-        # Prepare response
-        case_number = response_generator.extract_case_number(extracted_data)
+        # Prepare enhanced response
+        case_number = claim_extraction_result.extracted_claim.case_number if claim_extraction_result.extracted_claim else None
         
         return FileUploadResponse(
             response=response_text,
-            file_url=extracted_data.get("file_url"),
+            file_url=enhanced_data.get("file_url"),
             case_number=case_number,
-            is_valid=extracted_data.get("is_valid", False),
+            is_valid=claim_extraction_result.extracted_claim.is_valid if claim_extraction_result.extracted_claim else False,
             metadata={
-                "document_type": extracted_data.get("document_type"),
-                "validation_score": extracted_data.get("validation_score"),
-                "validation_errors": extracted_data.get("validation_errors", []),
-                "total_pages": extracted_data.get("total_pages", 1)
+                "document_type": enhanced_data.get("document_type"),
+                "validation_score": claim_extraction_result.extracted_claim.processing_confidence if claim_extraction_result.extracted_claim else 0.0,
+                "validation_errors": claim_extraction_result.extracted_claim.validation_errors if claim_extraction_result.extracted_claim else [],
+                "total_pages": enhanced_data.get("total_pages", 1),
+                "processing_id": claim_extraction_result.processing_id,
+                "processing_time": claim_extraction_result.processing_time,
+                "document_intelligence_confidence": claim_extraction_result.document_intelligence_confidence,
+                "openai_confidence": claim_extraction_result.openai_confidence,
+                "extraction_status": claim_extraction_result.status.value
             }
         )
         
@@ -370,6 +397,42 @@ async def download_file(
 
 
 # Helper functions
+async def _merge_extraction_results(extracted_data: dict, claim_extraction_result) -> dict:
+    """Merge original extraction data with enhanced claim extraction results."""
+    try:
+        enhanced_data = extracted_data.copy()
+        
+        # Add claim extraction results
+        if claim_extraction_result.extracted_claim:
+            claim_dict = claim_extraction_result.extracted_claim.dict()
+            enhanced_data["claim_info"] = claim_dict
+            
+            # Update existing fields with enhanced data
+            for field, value in claim_dict.items():
+                if value and value != "غير مذكور":
+                    enhanced_data[field] = value
+        
+        # Add processing metadata
+        enhanced_data["processing_id"] = claim_extraction_result.processing_id
+        enhanced_data["processing_time"] = claim_extraction_result.processing_time
+        enhanced_data["document_intelligence_confidence"] = claim_extraction_result.document_intelligence_confidence
+        enhanced_data["openai_confidence"] = claim_extraction_result.openai_confidence
+        enhanced_data["extraction_status"] = claim_extraction_result.status.value
+        enhanced_data["refined_response"] = claim_extraction_result.refined_response
+        
+        # Update validation information
+        if claim_extraction_result.extracted_claim:
+            enhanced_data["is_valid"] = claim_extraction_result.extracted_claim.is_valid
+            enhanced_data["validation_score"] = claim_extraction_result.extracted_claim.processing_confidence
+            enhanced_data["validation_errors"] = claim_extraction_result.extracted_claim.validation_errors
+        
+        return enhanced_data
+        
+    except Exception as e:
+        logger.error(f"Error merging extraction results: {e}")
+        return extracted_data
+
+
 async def _store_document_data(conversation_id: str, extracted_data: dict) -> None:
     """Store document data in the database."""
     from app.core.database import get_database

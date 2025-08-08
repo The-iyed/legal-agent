@@ -78,7 +78,7 @@ class StatementOfClaim(BaseModel):
 
 class FileUploadResponse(BaseModel):
     response: str
-    file_url: str
+    file_url: Optional[str] = None
     case_number: Optional[str] = None
     is_valid: bool
     metadata: dict[str, Any]

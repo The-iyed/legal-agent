@@ -11,6 +11,7 @@ A sophisticated AI agent system built with FastAPI and Azure OpenAI, designed to
   - Knowledge QA Agent: Specific content questions
   - Clarification Agent: Query refinement and clarification
 
+- **Enhanced PDF Processing**: Page-by-page PDF splitting with Document Intelligence for comprehensive text extraction
 - Dynamic prompt management system
 - Azure OpenAI integration
 - **MongoDB-based conversation and message storage with sharding support**
