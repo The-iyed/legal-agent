@@ -291,18 +291,12 @@ async def upload_attachments(
                 detail="Invalid conversation ID format"
             )
 
-        # Verify conversation exists and is in correct status
+        # Verify conversation exists
         conversation = await conversation_service.get_conversation(conversation_id)
         if conversation is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Conversation not found"
-            )
-        
-        if conversation.status != "waiting_for_attachments":
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Conversation must be in 'waiting_for_attachments' status. Current status: {conversation.status}"
             )
 
         # Validate files
