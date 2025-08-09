@@ -9,7 +9,8 @@ from app.schemas.agent import QueryRequest, QueryResponse, FileUploadRequest, Fi
 from app.schemas.message import MessageCreate
 from bson import ObjectId
 import logging
-from typing import Optional, Any, List
+import re
+from typing import Optional, Any, List, Union
 from pydantic import BaseModel, ConfigDict
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.routes.message import get_message_service
@@ -676,40 +677,68 @@ async def analyze_legal_basis(
 
         content = result.get("response", {}).get("content", "")
 
+        # Normalize markdown: convert H3/H2/H1 to bold headings, remove leading hashes
+        def normalize_md(text: str) -> str:
+            text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+            text = re.sub(r"^([\p{L}0-9].*):\s*$", r"**\\1**", text, flags=re.MULTILINE)
+            return text
+
+        try:
+            import regex as _re  # better unicode categories
+            def _norm_unicode(t: str) -> str:
+                t = _re.sub(r"^#{1,6}\s*", "", t, flags=_re.MULTILINE)
+                # Keep markdown lists/code blocks but make section headers bold if they are on their own line
+                t = _re.sub(r"^(?:\*\*|__)?([\p{L}\p{N}].{0,80}?)(?:\:)?\s*$", r"**\1**", t, flags=_re.MULTILINE)
+                return t
+            content = _norm_unicode(content)
+        except Exception:
+            content = normalize_md(content)
+
+        # Parse attachments_status block to decide next step
+        has_all = None
+        missing = []
+        try:
+            m = re.search(r"\[attachments_status\](.*?)\[/attachments_status\]", content, flags=re.DOTALL|re.IGNORECASE)
+            if m:
+                block = m.group(1)
+                has_line = re.search(r"HAS_ALL:\s*(yes|no)", block, flags=re.IGNORECASE)
+                if has_line:
+                    has_all = has_line.group(1).lower() == "yes"
+                miss_line = re.search(r"MISSING:\s*(.*)", block)
+                if miss_line:
+                    miss_val = miss_line.group(1).strip()
+                    if miss_val and miss_val.lower() != "<names>" and miss_val != "":
+                        missing = [x.strip() for x in miss_val.split(',') if x.strip()]
+                # Remove the block from the user-facing content
+                content = re.sub(r"\[attachments_status\].*?\[/attachments_status\]", "", content, flags=re.DOTALL|re.IGNORECASE).strip()
+        except Exception:
+            has_all = None
+
         # Store agent message in conversation history
         try:
             await agent_service._store_agent_message(
                 content,
-                {"query_type": "legal_basis"},
+                {"query_type": "legal_basis", "retrieval": "none", "attachments_status": ("all" if has_all else ("missing" if has_all is False else "unknown")), "missing": missing},
                 request.conversation_id,
                 {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0, "reasoning": "legal basis analysis without search"}
             )
         except Exception as e:
             logger.warning(f"Failed to store legal basis message: {e}")
 
-        # Post follow-up advisor message asking to proceed or add attachments
-        from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry as _AR
-        _reg = _AR()
-        advisor_class = _reg.get_agent_class("phase_advisor")
-        advisor_text = None
-        if advisor_class:
-            advisor = advisor_class(settings=agent_service.settings)
-            advisor_res = await advisor.execute("__ADVISE__", "", context=None)
-            advisor_text = (advisor_res or {}).get("response", {}).get("content")
-
-        followup = advisor_text or (
-            "هل ترغب في رفع مرفقات إضافية لدعم القضية، أم نتابع إلى: تحليل القضايا القانونية وإعداد الاعتراضات ثم مناقشة صياغة الوثائق القانونية؟"
-        )
+        # Always ask for attachments explicitly; do not auto‑finalize here
+        req_text = "نحتاج إلى استكمال المرفقات الداعمة قبل الانتقال للمرحلة التالية."
+        if missing:
+            req_text += "\nالمرفقات المطلوبة: " + ", ".join(missing)
+        req_text += "\nالرجاء رفعها عبر مسار: POST /agents/legal-basis/attachments-or-proceed، أو أبلغني أنك لا تملكها لنكمل بما لدينا." 
         await agent_service._store_agent_message(
-            followup,
-            {"query_type": "advisor_prompt", "after": "legal_basis"},
+            req_text,
+            {"query_type": "attachments_requirements", "missing": missing},
             request.conversation_id,
-            {"agent_type": "phase_advisor", "prompt_type": "legal_basis_next_steps", "confidence": 1.0}
+            {"agent_type": "chat", "prompt_type": "waiting_for_attachments", "confidence": 1.0}
         )
-
-        # Return analysis content (primary) and the follow-up invite
-        combined = content + "\n\n---\n" + followup
+        combined = content + "\n\n" + req_text
         return {"response": combined, "metadata": {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0}}
+
     except HTTPException:
         raise
     except Exception as e:
@@ -928,7 +957,7 @@ async def orient_to_legal_basis(
 async def legal_basis_attachments_or_proceed(
     conversation_id: str = Form(..., description="Conversation ID"),
     proceed: bool = Form(False, description="Set true to proceed without uploading files"),
-    files: List[UploadFile] = File(None, description="Attachment files to upload"),
+    files: Optional[Union[UploadFile, List[UploadFile]]] = File(None, description="Attachment files to upload (single or multiple)"),
     agent_service: AgentService = Depends(get_agent_service),
     conversation_service: ConversationService = Depends(get_conversation_service)
 ):
@@ -938,6 +967,13 @@ async def legal_basis_attachments_or_proceed(
         conversation = await conversation_service.get_conversation(conversation_id)
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
+
+        # Normalize files: accept single or list, drop empty
+        if files:
+            if isinstance(files, UploadFile):
+                files = [files]
+            else:
+                files = [f for f in files if getattr(f, "filename", None)]
 
         # Case 1: user uploaded attachments → process and rerun legal basis
         if files and len(files) > 0:
@@ -1094,6 +1130,18 @@ async def generate_legal_pleading(
         claim_text = (claim_doc or {}).get("raw_text", "")
         case_number = (claim_doc or {}).get("case_number", "—")
         plaintiff_name = (claim_doc or {}).get("plaintiff_name", "—")
+        claim_meta = ""
+        try:
+            cd = claim_doc or {}
+            fields = []
+            for k in ("court", "filing_date", "case_type", "case_subject"):
+                v = cd.get(k)
+                if v:
+                    fields.append(f"{k}: {v}")
+            if fields:
+                claim_meta = "; ".join(fields)
+        except Exception:
+            claim_meta = ""
 
         # attachments
         db = agent_service.db
@@ -1104,6 +1152,17 @@ async def generate_legal_pleading(
             if t:
                 attachments_texts.append(t)
         attachments_merged = "\n\n---\n".join(attachments_texts)
+        attachments_meta = ""
+        try:
+            cursor2 = db.attachments.find({"conversation_id": conversation_id}).sort("created_at", 1)
+            metas = []
+            async for att in cursor2:
+                fn = att.get("filename")
+                pages = ((att.get("extracted_content", {}) or {}).get("total_pages"))
+                metas.append(f"{fn or 'مرفق'}{('، صفحات: ' + str(pages)) if pages else ''}")
+            attachments_meta = "; ".join(metas[:6])
+        except Exception:
+            attachments_meta = ""
 
         # latest final analysis (if any)
         final_analysis = ""
@@ -1118,6 +1177,24 @@ async def generate_legal_pleading(
         except Exception:
             pass
 
+        # Build a brief conversation context (last few agent lines that support the ministry)
+        conv_context = ""
+        try:
+            history = await agent_service.message_service.get_conversation_messages(conversation_id, page=1, page_size=200, sort_desc=True)
+            lines = []
+            if history and hasattr(history, 'messages'):
+                for m in history.messages:
+                    md = m.message_data.get("metadata", {}) if isinstance(m.message_data, dict) else {}
+                    if m.message_data.get("type") == "agent_response":
+                        txt = m.message_data.get("content", "")
+                        if txt:
+                            lines.append(txt[:500])
+                    if len(lines) >= 3:
+                        break
+            conv_context = "\n\n---\n".join(lines)
+        except Exception:
+            conv_context = ""
+
         # Generate via LegalBasisAgent
         from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry
         registry = AgentRegistry()
@@ -1125,7 +1202,11 @@ async def generate_legal_pleading(
         if not agent_class:
             raise HTTPException(status_code=500, detail="LegalBasis agent not registered")
         agent = agent_class(settings=agent_service.settings)
-        pleading = await agent.generate_pleading(claim_text, attachments_merged, final_analysis, case_number, plaintiff_name)
+        # Inject conversation context into the pleading prompt
+        pleading_prompt = agent.prompt_manager.get_prompt("legal_basis", "pleading") or ""
+        pleading_prompt = pleading_prompt.replace("{{CONV_CONTEXT}}", conv_context)
+        pleading_prompt = pleading_prompt.replace("{{CLAIM_TEXT}}", claim_text or "").replace("{{ATTACHMENTS_TEXT}}", attachments_merged or "").replace("{{FINAL_ANALYSIS}}", final_analysis or "").replace("{{CASE_NUMBER}}", case_number or "—").replace("{{PLAINTIFF_NAME}}", plaintiff_name or "—").replace("{{CLAIM_META}}", claim_meta or "").replace("{{ATTACHMENTS_META}}", attachments_meta or "")
+        pleading = await agent._process_query([{"role": "system", "content": pleading_prompt}])
 
         # Store once (idempotent): skip if the same pleading already exists for this conversation
         stored_ok = False

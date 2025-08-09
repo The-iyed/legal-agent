@@ -6,6 +6,7 @@ from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.models import QueryType, QueryCaptionType, QueryAnswerType
 from ....core.config.settings import get_settings
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,19 @@ class LegalBasisAgent(BaseAgent):
             .replace("{{PLAINTIFF_NAME}}", plaintiff_name or "—")
         )
         return await self._process_query([{"role": "system", "content": prompt}])
+
+    def _sanitize_output(self, text: str) -> str:
+        if not text:
+            return ""
+        # Remove fenced code blocks like ```markdown ... ```
+        text = re.sub(r"```[a-zA-Z]*\s*([\s\S]*?)```", r"\1", text, flags=re.MULTILINE)
+        # Strip markdown headers (#####, ####, ###, ##, #)
+        text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+        # Remove horizontal rules
+        text = re.sub(r"^\s*---\s*$", "", text, flags=re.MULTILINE)
+        # Collapse excessive blank lines
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
 
     async def _stage_extract_issues(self, claim_text: str, attachments_text: str) -> str:
         prompt = self.prompts["extract_issues"].replace("{{CLAIM_TEXT}}", claim_text).replace("{{ATTACHMENTS_TEXT}}", attachments_text)
@@ -189,6 +203,9 @@ class LegalBasisAgent(BaseAgent):
             laws = await self._search_laws(queries)
             analysis = await self._stage_analysis(claim_text, attachments_text, issues, laws)
             defense = await self._stage_defense(analysis, laws)
+            # Sanitize to avoid duplicated markdown blocks or fenced code
+            analysis = self._sanitize_output(analysis)
+            defense = self._sanitize_output(defense)
             response = (
                 "🎯 الأساس القانوني للدعوى (ملخص منظم)\n\n" + analysis.strip() + "\n\n"
                 "🛡️ نقاط الدفاع المقترحة للبلدية\n\n" + defense.strip()

@@ -2165,53 +2165,94 @@ Create a detailed response with these sections:
             # Build professional legal response
             response_parts = []
             
-            # Header
-            response_parts.append("✅ **تمت قراءة صحيفة الدعوى المرفوعة بنجاح**")
-            response_parts.append("سأزودك الآن بملخص منظم وتفاصيل أساسية عن المستند.")
-            response_parts.append("")
-            response_parts.append("🎯 **تحليل قانوني شامل للمستند المرفوع**")
+            # Header (lawyerly, concise)
+            response_parts.append("✅ تمت قراءة صحيفة الدعوى بنجاح.")
+            response_parts.append("فيما يلي عرض مهني منظم لأهم ما ورد، يليه إبراز نقاط حساسة وخطوات عملية.")
             response_parts.append("")
             
             # Basic case information
-            response_parts.append("📋 **معلومات الدعوى الأساسية:**")
+            response_parts.append("أولاً: معلومات أساسية عن الدعوى")
             response_parts.append(f"• نوع الدعوى: {claim.case_type or 'غير محدد'}")
             response_parts.append(f"• رقم القضية: {claim.case_number or 'غير محدد'}")
             response_parts.append(f"• عدد الصفحات: {extraction_result.extracted_claim.total_pages or 1}")
             response_parts.append("")
             
             # Parties information
-            response_parts.append("👥 **الأطراف المعنية:**")
+            response_parts.append("ثانياً: الأطراف المعنية")
             response_parts.append(f"• المدعي: {claim.plaintiff_name or 'غير محدد'}")
             response_parts.append(f"• المدعى عليه: {claim.defendant_name or 'غير محدد'}")
             response_parts.append("")
-            
-            # Case details
-            response_parts.append("📄 **تفاصيل القضية:**")
+             
+            response_parts.append("ثالثاً: عرض منظم لوقائع الدعوى ومطالب المدعي")
             if claim.case_subject:
                 response_parts.append(f"• موضوع الدعوى: {claim.case_subject}")
             if claim.claim_amount:
                 response_parts.append(f"• مبلغ المطالبة: {claim.claim_amount}")
             if claim.court_name:
                 response_parts.append(f"• المحكمة المختصة: {claim.court_name}")
+            # Try to surface claimant asks from overview text if available
+            if getattr(claim, 'claim_overview', None):
+                text = claim.claim_overview.strip()
+                response_parts.append("• مطالب المدعي كما تظهر من المستند: ")
+                # naive split to bullets for readability, skipping legal evaluation lines
+                excluded_phrases = ["التقييم القانوني", "تحليل قانوني", "تقييم قانوني"]
+                for line in [l.strip('-• \t') for l in text.split('\n') if l.strip()][:10]:
+                    if any(phrase in line for phrase in excluded_phrases):
+                        continue
+                    if len([c for c in line if c.isalnum()]) < 2:
+                        continue
+                    response_parts.append(f"  - {line}")
             response_parts.append("")
             
-            # Legal analysis
-            response_parts.append("⚖️ **التحليل القانوني:**")
-            if claim.claim_overview:
-                response_parts.append(claim.claim_overview)
+            # Declarations section extracted from OCR text (الإقرارات)
+            response_parts.append("**رابعاً: الإقرارات**")
+            response_parts.append("• الإقرارات الموجودة في صحيفة الدعوى:")
+            declarations_lines = []
+            try:
+                from app.modules.claim_extractor.text_processor import TextProcessor
+                if extraction_result.raw_text:
+                    sections = TextProcessor().extract_saudi_legal_sections(extraction_result.raw_text)
+                    decl_text = (sections or {}).get("declarations", "").strip()
+                    if decl_text:
+                        for line in [l.strip() for l in decl_text.split("\n") if l.strip()]:
+                            if len(declarations_lines) >= 6:
+                                break
+                            # prioritize lines that look like explicit declarations/acknowledgements
+                            if (any(kw in line for kw in ["أقر", "أتعهد", "أوافق"]) or line.startswith("-") or line.startswith("•")) and ("الاقرارات" not in line):
+                                cleaned = line.lstrip("•- ").strip()
+                                if cleaned:
+                                    declarations_lines.append(f"- {cleaned}")
+            except Exception:
+                pass
+            if declarations_lines:
+                response_parts.extend(declarations_lines)
             else:
-                response_parts.append("تم استخراج النص بنجاح، لكن يلزم تحليل إضافي لتحديد التفاصيل القانونية.")
+                response_parts.append("- لم يتم العثور على إقرارات واضحة في النص المستخرج.")
             response_parts.append("")
             
-            # Call to action
-            response_parts.append("📎 **الخطوة التالية:**")
-            response_parts.append("• لنتقدم في تحليل القضية بدقّة، يرجى رفع المرفقات الداعمة (مثل القرارات، الاعتراضات، التراخيص).")
-            
+            # Highlights
+            response_parts.append("خامساً: نقاط بارزة تستحق الانتباه")
+            highlights = []
+            if claim.plaintiff_name:
+                highlights.append("اسم المدعي مؤكد وثابت في الصحيفة.")
+            if claim.case_subject:
+                highlights.append("موضوع الدعوى مذكور بوضوح، ما يسمح ببناء دفوع شكلية وموضوعية مناسبة.")
+            if claim.case_number:
+                highlights.append("رقم القضية متاح، ما يسهل الربط بالمستندات الإدارية.")
+            if not highlights:
+                highlights.append("لا توجد معلومات بارزة إضافية حالياً؛ سنعتمد على المرفقات لتعزيز القراءة.")
+            response_parts.extend([f"- {h}" for h in highlights])
+            response_parts.append("")
+
+            # Closing note (defense-oriented)
+            response_parts.append("سادساً: ملاحظة ختامية دفاعية")
+            response_parts.append("- سنبني دفوع الأمانة على ما ورد في الصحيفة وما يتوافر لاحقاً من مستندات، مع إبراز أي ثغرات شكلية أو موضوعية تُسهم في رفض طلبات المدعي.")
+             
             return "\n".join(response_parts)
             
         except Exception as e:
             logger.error(f"Error generating professional legal response: {e}")
-            return "عذراً، حدث خطأ أثناء تحليل المستند. يرجى المحاولة مرة أخرى."
+            return "تمت قراءة الملف، ويمكننا المتابعة بتفصيل الردود القانونية عند إرفاق الوثائق الداعمة."
 
     async def _append_attachments_to_claim(self, conversation_id: str, attachment_results: List[Dict[str, Any]]) -> None:
         """Append attachments info (including raw_text) to the existing statement_of_claim document."""
