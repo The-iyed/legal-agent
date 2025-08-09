@@ -6,9 +6,10 @@ from app.modules.agent.service import AgentService
 from app.modules.conversation.service import ConversationService
 from app.modules.message.service import MessageService
 from app.schemas.agent import QueryRequest, QueryResponse, FileUploadRequest, FileUploadResponse, FileInfoResponse
+from app.schemas.message import MessageCreate
 from bson import ObjectId
 import logging
-from typing import Optional, Any
+from typing import Optional, Any, List
 from pydantic import BaseModel, ConfigDict
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.routes.message import get_message_service
@@ -259,7 +260,7 @@ async def upload_file(
 async def upload_attachments(
     conversation_id: str = Form(..., description="Conversation ID"),
     user_id: str = Form(..., description="User ID"),
-    files: list[UploadFile] = File(..., description="Attachment files to upload"),
+    files: List[UploadFile] = File(..., description="Attachment files to upload"),
     agent_service: AgentService = Depends(get_agent_service),
     conversation_service: ConversationService = Depends(get_conversation_service)
 ):
@@ -622,3 +623,566 @@ async def attachments_overview(
     except Exception as e:
         logger.error(f"attachments_overview error: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate attachments overview") 
+
+class LegalBasisRequest(BaseModel):
+    conversation_id: str
+    user_id: Optional[str] = None
+
+@router.post(
+    "/legal-basis/analyze",
+    response_model=QueryResponse,
+    summary="Advance to legal basis phase and generate analysis",
+    description="Analyzes the claim and current attachments without Azure Search; then invites user to proceed or add more attachments."
+)
+async def analyze_legal_basis(
+    request: LegalBasisRequest,
+    agent_service: AgentService = Depends(get_agent_service),
+    conversation_service: ConversationService = Depends(get_conversation_service)
+):
+    try:
+        if not ObjectId.is_valid(request.conversation_id):
+            raise HTTPException(status_code=400, detail="Invalid conversation ID format")
+        conversation = await conversation_service.get_conversation(request.conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        # Fetch full claim text
+        claim_doc = await agent_service.get_statement_of_claim(request.conversation_id)
+        claim_text = (claim_doc or {}).get("raw_text", "")
+
+        # Fetch attachments text and merge
+        db = agent_service.db
+        attachments_texts = []
+        cursor = db.attachments.find({"conversation_id": request.conversation_id}).sort("created_at", 1)
+        async for att in cursor:
+            t = ((att.get("extracted_content", {}) or {}).get("raw_text", "") or "").strip()
+            if t:
+                attachments_texts.append(t)
+        attachments_merged = "\n\n---\n".join(attachments_texts)
+
+        # Build context for agent
+        context = [
+            {"_key": "claim_text", "_value": claim_text},
+            {"_key": "attachments_text", "_value": attachments_merged}
+        ]
+
+        # Run LegalBasisAgent WITHOUT Azure Search
+        from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry
+        registry = AgentRegistry()
+        agent_class = registry.get_agent_class("legal_basis")
+        if not agent_class:
+            raise HTTPException(status_code=500, detail="LegalBasis agent not registered")
+        agent = agent_class(settings=agent_service.settings)
+        result = await agent.execute_without_search("__LEGAL_BASIS__", "", context=context)
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+
+        # Update status to LEGAL_BASIS
+        await conversation_service.update_conversation_status(request.conversation_id, ConversationStatus.LEGAL_BASIS)
+
+        content = result.get("response", {}).get("content", "")
+
+        # Store agent message in conversation history
+        try:
+            await agent_service._store_agent_message(
+                content,
+                {"query_type": "legal_basis"},
+                request.conversation_id,
+                {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0, "reasoning": "legal basis analysis without search"}
+            )
+        except Exception as e:
+            logger.warning(f"Failed to store legal basis message: {e}")
+
+        # Post follow-up advisor message asking to proceed or add attachments
+        from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry as _AR
+        _reg = _AR()
+        advisor_class = _reg.get_agent_class("phase_advisor")
+        advisor_text = None
+        if advisor_class:
+            advisor = advisor_class(settings=agent_service.settings)
+            advisor_res = await advisor.execute("__ADVISE__", "", context=None)
+            advisor_text = (advisor_res or {}).get("response", {}).get("content")
+
+        followup = advisor_text or (
+            "هل ترغب في رفع مرفقات إضافية لدعم القضية، أم نتابع إلى: تحليل القضايا القانونية وإعداد الاعتراضات ثم مناقشة صياغة الوثائق القانونية؟"
+        )
+        await agent_service._store_agent_message(
+            followup,
+            {"query_type": "advisor_prompt", "after": "legal_basis"},
+            request.conversation_id,
+            {"agent_type": "phase_advisor", "prompt_type": "legal_basis_next_steps", "confidence": 1.0}
+        )
+
+        # Return analysis content (primary) and the follow-up invite
+        combined = content + "\n\n---\n" + followup
+        return {"response": combined, "metadata": {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error analyzing legal basis: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to analyze legal basis: {e}") 
+
+@router.post(
+    "/legal-basis/update-with-attachments",
+    response_model=QueryResponse,
+    summary="Update legal basis analysis using newly uploaded attachments",
+    description="Generates a concise addendum to the prior legal-basis analysis based on new attachments; stores the update as a message."
+)
+async def update_legal_basis_with_attachments(
+    conversation_id: str = Body(..., embed=True),
+    agent_service: AgentService = Depends(get_agent_service),
+    conversation_service: ConversationService = Depends(get_conversation_service)
+):
+    try:
+        if not ObjectId.is_valid(conversation_id):
+            raise HTTPException(status_code=400, detail="Invalid conversation ID format")
+        conversation = await conversation_service.get_conversation(conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        # Fetch prior legal-basis message content (latest)
+        messages = await agent_service.message_service.get_conversation_messages(conversation_id, page=1, page_size=200)
+        previous_analysis = ""
+        if messages and hasattr(messages, 'messages'):
+            # iterate reversed to find last legal_basis
+            for m in reversed(messages.messages):
+                md = m.message_data.get("metadata", {}) if isinstance(m.message_data, dict) else {}
+                if md.get("agent_type") == "legal_basis" or md.get("query_type") == "legal_basis":
+                    previous_analysis = m.message_data.get("content", "")
+                    break
+
+        # Fetch full claim text
+        claim_doc = await agent_service.get_statement_of_claim(conversation_id)
+        claim_text = (claim_doc or {}).get("raw_text", "")
+
+        # Collect only newly added attachments since last update: for simplicity take latest 10
+        db = agent_service.db
+        attachments_texts = []
+        cursor = db.attachments.find({"conversation_id": conversation_id}).sort("created_at", -1).limit(10)
+        async for att in cursor:
+            t = ((att.get("extracted_content", {}) or {}).get("raw_text", "") or "").strip()
+            if t:
+                attachments_texts.append(t)
+        new_attachments_text = "\n\n---\n".join(attachments_texts)
+
+        # Run update addendum through LegalBasisAgent
+        from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry
+        registry = AgentRegistry()
+        agent_class = registry.get_agent_class("legal_basis")
+        if not agent_class:
+            raise HTTPException(status_code=500, detail="LegalBasis agent not registered")
+        agent = agent_class(settings=agent_service.settings)
+        addendum = await agent.update_with_new_attachments(previous_analysis, claim_text, new_attachments_text)
+
+        # Keep/ensure status at LEGAL_BASIS
+        try:
+            await conversation_service.update_conversation_status(conversation_id, ConversationStatus.LEGAL_BASIS)
+        except Exception:
+            pass
+
+        # Store the addendum as an agent message
+        await agent_service._store_agent_message(
+            addendum,
+            {"query_type": "legal_basis_update", "attachments_count_considered": len(attachments_texts)},
+            conversation_id,
+            {"agent_type": "legal_basis", "prompt_type": "update", "confidence": 1.0}
+        )
+
+        return {"response": addendum, "metadata": {"agent_type": "legal_basis", "prompt_type": "update", "confidence": 1.0}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating legal basis with attachments: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to update legal basis: {e}")
+
+@router.post(
+    "/attachments/request",
+    response_model=QueryResponse,
+    summary="Ask user for specific attachments or confirm proceeding to next phase",
+    description="In WAITING_FOR_ATTACHMENTS state, generate a focused message asking for concrete attachments that strengthen the municipality's position; if user confirms no attachments, advance to legal basis phase."
+)
+async def request_attachments_or_proceed(
+    conversation_id: str = Body(...),
+    confirm_proceed: bool = Body(False, description="If true, proceed to legal basis phase immediately"),
+    agent_service: AgentService = Depends(get_agent_service),
+    conversation_service: ConversationService = Depends(get_conversation_service)
+):
+    try:
+        if not ObjectId.is_valid(conversation_id):
+            raise HTTPException(status_code=400, detail="Invalid conversation ID format")
+        conversation = await conversation_service.get_conversation(conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        # Only operate in WAITING_FOR_ATTACHMENTS, CLAIM_DISCUSSION, or CLAIM_DOCS_DISCUSSION
+        if conversation.status not in [ConversationStatus.WAITING_FOR_ATTACHMENTS, ConversationStatus.CLAIM_DISCUSSION, ConversationStatus.CLAIM_DOCS_DISCUSSION]:
+            raise HTTPException(status_code=400, detail=f"Invalid status for attachment request: {conversation.status}")
+
+        if confirm_proceed:
+            # Move to legal basis phase
+            await conversation_service.update_conversation_status(conversation_id, ConversationStatus.LEGAL_BASIS)
+            content = (
+                "تم استلام تأكيدك. سننتقل الآن إلى مرحلة: تحليل القضايا القانونية وإعداد الاعتراضات، ثم مناقشة صياغة الوثائق القانونية."
+            )
+            await agent_service._store_agent_message(
+                content,
+                {"query_type": "attachments_request", "action": "proceed_to_legal_basis"},
+                conversation_id,
+                {"agent_type": "chat", "prompt_type": "waiting_for_attachments", "confidence": 1.0}
+            )
+            return {"response": content, "metadata": {"status": "legal_basis"}}
+
+        # Ensure we are in WAITING_FOR_ATTACHMENTS to enforce strict prompt behavior
+        if conversation.status != ConversationStatus.WAITING_FOR_ATTACHMENTS:
+            try:
+                await conversation_service.update_conversation_status(conversation_id, ConversationStatus.WAITING_FOR_ATTACHMENTS)
+            except Exception:
+                pass
+
+        # Generate focused request using the updated waiting_for_attachments prompt via supervisor
+        convo_data = await agent_service._get_conversation_with_status(conversation_id)
+        prompt = convo_data.get("prompt") if convo_data else None
+        history = await agent_service._get_conversation_history(conversation_id)
+        supervisor_result = await agent_service.supervisor.route_query(
+            query="ما هي المرفقات المطلوبة لدعم موقف الأمانة؟",
+            context=history,
+            system_prompt=prompt,
+            conversation_status=ConversationStatus.WAITING_FOR_ATTACHMENTS
+        )
+        content, agent_metadata = agent_service._extract_response_data(supervisor_result)
+        await agent_service._store_agent_message(
+            content,
+            {"query_type": "attachments_request"},
+            conversation_id,
+            supervisor_result
+        )
+        return {"response": content, "metadata": {"agent_type": supervisor_result.get("agent_type"), "prompt_type": supervisor_result.get("prompt_type"), "confidence": supervisor_result.get("confidence")}}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in attachments request: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to request attachments: {e}") 
+
+@router.post(
+    "/legal-basis/orient",
+    response_model=QueryResponse,
+    summary="Confirm and announce next-phase actions",
+    description="Returns a confirmation message that the system will now start تحليل القضايا القانونية وإعداد الاعتراضات باستخدام Azure AI Search, followed by مناقشة صياغة الوثائق القانونية."
+)
+async def orient_to_legal_basis(
+    conversation_id: str = Body(..., embed=True),
+    agent_service: AgentService = Depends(get_agent_service),
+    conversation_service: ConversationService = Depends(get_conversation_service)
+):
+    try:
+        if not ObjectId.is_valid(conversation_id):
+            raise HTTPException(status_code=400, detail="Invalid conversation ID format")
+        conversation = await conversation_service.get_conversation(conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        content = (
+            "تم تأكيد الانتقال إلى المرحلة التالية.\n\n"
+            "سنبدأ الآن بـ: \n"
+            "1) تحليل القضايا القانونية وإعداد الاعتراضات باستخدام Azure AI Search استناداً إلى صحيفة الدعوى والمرفقات.\n"
+            "2) مناقشة صياغة الوثائق القانونية (المذكرات/اللائحة) والبنود المقترحة للصياغة.\n\n"
+            "سأبقيك على اطلاع بالخطوات والنتائج تباعاً."
+        )
+
+        await agent_service._store_agent_message(
+            content,
+            {"query_type": "orientation", "next": "response_drafting"},
+            conversation_id,
+            {"agent_type": "chat", "prompt_type": "default", "confidence": 1.0}
+        )
+        return {"response": content, "metadata": {"agent_type": "chat", "prompt_type": "default", "confidence": 1.0}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error sending orientation message: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send orientation message: {e}") 
+
+# Note: multipart form is defined via function signature; no Pydantic body model needed here.
+
+@router.post(
+    "/legal-basis/attachments-or-proceed",
+    response_model=QueryResponse,
+    summary="Upload attachments to refresh legal analysis or proceed to drafting",
+    description="If files are provided, they are processed and legal basis is rerun. If proceed=true (and no files), user is oriented to proceed to drafting; status may update to response_drafting.",
+    openapi_extra={
+        "requestBody": {
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "conversation_id": {"type": "string"},
+                            "proceed": {"type": "boolean"},
+                            "files": {
+                                "type": "array",
+                                "items": {"type": "string", "format": "binary"}
+                            }
+                        },
+                        "required": ["conversation_id"]
+                    }
+                }
+            }
+        }
+    }
+)
+async def legal_basis_attachments_or_proceed(
+    conversation_id: str = Form(..., description="Conversation ID"),
+    proceed: bool = Form(False, description="Set true to proceed without uploading files"),
+    files: List[UploadFile] = File(None, description="Attachment files to upload"),
+    agent_service: AgentService = Depends(get_agent_service),
+    conversation_service: ConversationService = Depends(get_conversation_service)
+):
+    try:
+        if not ObjectId.is_valid(conversation_id):
+            raise HTTPException(status_code=400, detail="Invalid conversation ID format")
+        conversation = await conversation_service.get_conversation(conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        # Case 1: user uploaded attachments → process and rerun legal basis
+        if files and len(files) > 0:
+            # Disallow adding attachments after proceeding to drafting or later
+            if conversation.status in [ConversationStatus.RESPONSE_DRAFTING, ConversationStatus.RESPONSE_COMPLETED, ConversationStatus.CLOSED]:
+                raise HTTPException(status_code=400, detail=f"Attachments are not allowed after proceeding to drafting. Current status: {conversation.status}")
+
+            # Process attachments
+            attach_result = await agent_service.process_attachments(files, conversation_id, user_id="system")
+
+            # Re-run legal basis analysis with full claim + new attachments
+            class _LBReq(BaseModel):
+                conversation_id: str
+                user_id: Optional[str] = None
+            lb_req = _LBReq(conversation_id=conversation_id)
+            result = await analyze_legal_basis(lb_req, agent_service, conversation_service)  # reuse route logic
+            return result
+
+        # Case 2: no attachments. If proceed flag set → update status and orient/proceed
+        if proceed:
+            # Update status to RESPONSE_DRAFTING as next phase for document drafting
+            await conversation_service.update_conversation_status(conversation_id, ConversationStatus.RESPONSE_DRAFTING)
+
+            # Confirm proceeding without asking again
+            content = (
+                "تم تأكيد انتقالك إلى المرحلة التالية.\n\n"
+                "سنبدأ الآن في تحليل القضايا القانونية وإعداد الاعتراضات ثم مناقشة صياغة الوثائق القانونية بناءً على النتائج الحالية."
+            )
+
+            await agent_service._store_agent_message(
+                content,
+                {"query_type": "proceed_to_drafting"},
+                conversation_id,
+                {"agent_type": "chat", "prompt_type": "default", "confidence": 1.0}
+            )
+
+            return {"response": content, "metadata": {"agent_type": "chat", "prompt_type": "default", "confidence": 1.0}}
+
+        # Case 3: neither files nor proceed → Ask the question via advisor
+        from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry
+        registry = AgentRegistry()
+        advisor_class = registry.get_agent_class("phase_advisor")
+        if not advisor_class:
+            raise HTTPException(status_code=500, detail="Phase advisor agent not registered")
+        advisor = advisor_class(settings=agent_service.settings)
+        advisor_res = await advisor.execute("__ADVISE__", "", context=None)
+        content = (advisor_res or {}).get("response", {}).get("content", "")
+        await agent_service._store_agent_message(
+            content,
+            {"query_type": "advisor_prompt"},
+            conversation_id,
+            {"agent_type": "phase_advisor", "prompt_type": "legal_basis_next_steps", "confidence": 1.0}
+        )
+        return {"response": content, "metadata": {"agent_type": "phase_advisor", "prompt_type": "legal_basis_next_steps", "confidence": 1.0}}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in legal_basis/attachments-or-proceed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to handle attachments or proceed: {e}") 
+
+@router.post(
+    "/legal-basis/finalize",
+    response_model=QueryResponse,
+    summary="Run final legal-basis with Azure Search and move to drafting discussion",
+    description="Requires the conversation to have proceeded to drafting. Runs the full pipeline (issues → plan → Azure AI Search → analysis → defense) and stores the result."
+)
+async def finalize_legal_basis(
+    conversation_id: str = Body(..., embed=True),
+    agent_service: AgentService = Depends(get_agent_service),
+    conversation_service: ConversationService = Depends(get_conversation_service)
+):
+    try:
+        if not ObjectId.is_valid(conversation_id):
+            raise HTTPException(status_code=400, detail="Invalid conversation ID format")
+        conversation = await conversation_service.get_conversation(conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        # Must have proceeded to drafting
+        if conversation.status != ConversationStatus.RESPONSE_DRAFTING:
+            raise HTTPException(status_code=400, detail=f"Conversation must be in 'response_drafting' after proceed. Current: {conversation.status}")
+
+        # Build context
+        claim_doc = await agent_service.get_statement_of_claim(conversation_id)
+        claim_text = (claim_doc or {}).get("raw_text", "")
+        db = agent_service.db
+        attachments_texts = []
+        cursor = db.attachments.find({"conversation_id": conversation_id}).sort("created_at", 1)
+        async for att in cursor:
+            t = ((att.get("extracted_content", {}) or {}).get("raw_text", "") or "").strip()
+            if t:
+                attachments_texts.append(t)
+        attachments_merged = "\n\n---\n".join(attachments_texts)
+        context = [
+            {"_key": "claim_text", "_value": claim_text},
+            {"_key": "attachments_text", "_value": attachments_merged}
+        ]
+
+        # Run LegalBasisAgent with Azure Search (full pipeline)
+        from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry
+        registry = AgentRegistry()
+        agent_class = registry.get_agent_class("legal_basis")
+        if not agent_class:
+            raise HTTPException(status_code=500, detail="LegalBasis agent not registered")
+        agent = agent_class(settings=agent_service.settings)
+        result = await agent.execute("__LEGAL_BASIS_FINAL__", "", context=context)
+        if result.get("error"):
+            raise HTTPException(status_code=500, detail=result["error"])
+
+        content = result.get("response", {}).get("content", "")
+
+        # Keep status at RESPONSE_DRAFTING for continued discussion
+        try:
+            await conversation_service.update_conversation_status(conversation_id, ConversationStatus.RESPONSE_DRAFTING)
+        except Exception:
+            pass
+
+        # Store final message
+        await agent_service._store_agent_message(
+            content,
+            {"query_type": "legal_basis_final", "search": "azure_ai_search", "attachments_count_considered": len(attachments_texts)},
+            conversation_id,
+            {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0}
+        )
+
+        return {"response": content, "metadata": {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error finalizing legal basis: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to finalize legal basis: {e}") 
+
+@router.post(
+    "/legal-basis/generate-pleading",
+    response_model=QueryResponse,
+    summary="Generate formal legal pleading memo",
+    description="Generates a structured legal pleading (لائحة الرد) using claim, attachments, and the latest final analysis. Sections: الوقائع، الدفع الشكلي، الدفع الموضوعي، الخلاصة، الطلبات."
+)
+async def generate_legal_pleading(
+    conversation_id: str = Body(..., embed=True),
+    agent_service: AgentService = Depends(get_agent_service),
+    conversation_service: ConversationService = Depends(get_conversation_service)
+):
+    try:
+        if not ObjectId.is_valid(conversation_id):
+            raise HTTPException(status_code=400, detail="Invalid conversation ID format")
+        conversation = await conversation_service.get_conversation(conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        # Gather context
+        claim_doc = await agent_service.get_statement_of_claim(conversation_id)
+        claim_text = (claim_doc or {}).get("raw_text", "")
+        case_number = (claim_doc or {}).get("case_number", "—")
+        plaintiff_name = (claim_doc or {}).get("plaintiff_name", "—")
+
+        # attachments
+        db = agent_service.db
+        attachments_texts = []
+        cursor = db.attachments.find({"conversation_id": conversation_id}).sort("created_at", 1)
+        async for att in cursor:
+            t = ((att.get("extracted_content", {}) or {}).get("raw_text", "") or "").strip()
+            if t:
+                attachments_texts.append(t)
+        attachments_merged = "\n\n---\n".join(attachments_texts)
+
+        # latest final analysis (if any)
+        final_analysis = ""
+        try:
+            messages = await agent_service.message_service.get_conversation_messages(conversation_id, page=1, page_size=200)
+            if messages and hasattr(messages, 'messages'):
+                for m in reversed(messages.messages):
+                    md = m.message_data.get("metadata", {}) if isinstance(m.message_data, dict) else {}
+                    if md.get("query_type") == "legal_basis_final":
+                        final_analysis = m.message_data.get("content", "")
+                        break
+        except Exception:
+            pass
+
+        # Generate via LegalBasisAgent
+        from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry
+        registry = AgentRegistry()
+        agent_class = registry.get_agent_class("legal_basis")
+        if not agent_class:
+            raise HTTPException(status_code=500, detail="LegalBasis agent not registered")
+        agent = agent_class(settings=agent_service.settings)
+        pleading = await agent.generate_pleading(claim_text, attachments_merged, final_analysis, case_number, plaintiff_name)
+
+        # Store
+        await agent_service._store_agent_message(
+            pleading,
+            {"query_type": "pleading", "case_number": case_number},
+            conversation_id,
+            {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0}
+        )
+
+        # Force-write using MessageService as a safeguard
+        try:
+            agent_msg = MessageCreate(
+                conversation_id=conversation_id,
+                user_id=None,
+                message_data={
+                    "type": "agent_response",
+                    "content": pleading,
+                    "metadata": {"query_type": "pleading", "agent_type": "legal_basis", "prompt_type": "pleading"}
+                }
+            )
+            await agent_service.message_service.create_message(agent_msg)
+        except Exception as _:
+            pass
+
+        # Verify stored
+        stored_ok = False
+        try:
+            msgs = await agent_service.message_service.get_conversation_messages(conversation_id, page=1, page_size=50)
+            if msgs and hasattr(msgs, 'messages'):
+                for m in reversed(msgs.messages):
+                    md = m.message_data.get("metadata", {}) if isinstance(m.message_data, dict) else {}
+                    if md.get("query_type") == "pleading":
+                        stored_ok = True
+                        break
+        except Exception:
+            pass
+
+        # Provide follow-up notice
+        followup = "تم توليد لائحة الرد القانونية. أنا جاهز الآن للإجابة عن أي أسئلة تفصيلية تتعلق بالقضية ومرفقاتها وتحليلها النهائي."
+        await agent_service._store_agent_message(
+            followup,
+            {"query_type": "pleading_followup"},
+            conversation_id,
+            {"agent_type": "chat", "prompt_type": "default", "confidence": 1.0}
+        )
+
+        combined = pleading + "\n\n---\n" + followup
+        return {"response": combined, "metadata": {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0, "stored_ok": stored_ok}}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error generating pleading: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to generate pleading: {e}") 

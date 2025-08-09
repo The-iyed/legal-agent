@@ -231,7 +231,7 @@ class AgentService:
             
             # Store user message about file upload
             await self._store_file_upload_message(filename, conversation_id, user_id)
-
+            
             # Cache by file hash (content + filename)
             cache_key = self._generate_cache_key(file_content, filename)
             # Try Redis cache first
@@ -1544,7 +1544,7 @@ Create a detailed response with these sections:
                 f"- تم حفظ النص المستخرج لكل مرفق ({len(attachment_results)}) وربطه بهذه المحادثة.\n"
                 "يمكنك الآن مناقشة المرفقات معي مباشرة أو رفع المزيد عند الحاجة."
             )
-             
+            
             return response
             
         except Exception as e:

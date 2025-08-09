@@ -24,6 +24,7 @@ class ConversationStatusManager:
             ConversationStatus.WAITING_FOR_ATTACHMENTS: "waiting_for_attachments",
             ConversationStatus.CLAIM_DISCUSSION: "claim_discussion",
             ConversationStatus.CLAIM_DOCS_DISCUSSION: "claim_docs_discussion",
+            ConversationStatus.LEGAL_BASIS: "legal_basis",
             ConversationStatus.RESPONSE_DRAFTING: "default",
             ConversationStatus.RESPONSE_COMPLETED: "default",
             ConversationStatus.CLOSED: "default",
@@ -98,13 +99,33 @@ class ConversationStatusManager:
                 ConversationStatus.CLAIM_VALIDATED,
                 ConversationStatus.CLAIM_DISCUSSION,
                 ConversationStatus.CLAIM_DOCS_DISCUSSION,
+                ConversationStatus.LEGAL_BASIS,
                 ConversationStatus.RESPONSE_DRAFTING,
+                ConversationStatus.CLOSED
+            ],
+            ConversationStatus.CLAIM_DISCUSSION: [
+                ConversationStatus.WAITING_FOR_ATTACHMENTS,
+                ConversationStatus.CLAIM_DOCS_DISCUSSION,
+                ConversationStatus.LEGAL_BASIS,
+                ConversationStatus.RESPONSE_DRAFTING,
+                ConversationStatus.CLOSED
+            ],
+            ConversationStatus.CLAIM_DOCS_DISCUSSION: [
+                ConversationStatus.LEGAL_BASIS,
+                ConversationStatus.RESPONSE_DRAFTING,
+                ConversationStatus.CLAIM_DISCUSSION,
+                ConversationStatus.CLOSED
+            ],
+            ConversationStatus.LEGAL_BASIS: [
+                ConversationStatus.RESPONSE_DRAFTING,
+                ConversationStatus.CLAIM_DISCUSSION,
                 ConversationStatus.CLOSED
             ],
             ConversationStatus.RESPONSE_DRAFTING: [
                 ConversationStatus.RESPONSE_COMPLETED,
                 ConversationStatus.CLAIM_DISCUSSION,
                 ConversationStatus.CLAIM_DOCS_DISCUSSION,
+                ConversationStatus.LEGAL_BASIS,
                 ConversationStatus.CLOSED
             ],
             ConversationStatus.RESPONSE_COMPLETED: [
@@ -126,6 +147,9 @@ class ConversationStatusManager:
         Returns:
             True if transition is valid, False otherwise
         """
+        # Allow idempotent updates (same status -> same status)
+        if current_status == target_status:
+            return True
         available_transitions = self.get_available_transitions(current_status)
         return target_status in available_transitions
     
@@ -144,7 +168,7 @@ class ConversationStatusManager:
             ConversationStatus.CLAIM_UPLOADED: "تم رفع صحيفة الدعوى",
             ConversationStatus.CLAIM_VALIDATED: "تم التحقق من صحة صحيفة الدعوى",
             ConversationStatus.CLAIM_REJECTED: "تم رفض صحيفة الدعوى",
-            ConversationStatus.WAITING_FOR_ATTACHMENTS: "في انتظار رفع المرفقات الداعمة",
+            ConversationStatus.WAITING_FOR_ATTACHMENTS: "جمع المرفقات الداعمة أو الانتقال للمرحلة التالية",
             ConversationStatus.CLAIM_DISCUSSION: "نقاش تفصيلي حول محتوى صحيفة الدعوى",
             ConversationStatus.CLAIM_DOCS_DISCUSSION: "نقاش حول المرفقات وصحيفة الدعوى",
             ConversationStatus.RESPONSE_DRAFTING: "جاري إعداد لائحة الرد",

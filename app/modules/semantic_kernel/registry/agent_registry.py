@@ -57,6 +57,16 @@ class AgentRegistry:
             Extracts the exact referenced content from conversation history and reformulates questions to be explicit and self-contained 
             for better processing by specialist agents."""
         },
+        "legal_basis": {
+            "class": __import__("app.modules.agent_kernel.agents.legal_basis_agent", fromlist=["LegalBasisAgent"]).LegalBasisAgent,
+            "name": "Legal Basis Analyzer",
+            "description": "Analyzes claim and attachments, fetches laws, synthesizes legal basis and defense points"
+        },
+        "phase_advisor": {
+            "class": __import__("app.modules.agent_kernel.agents.phase_advisor_agent", fromlist=["PhaseAdvisorAgent"]).PhaseAdvisorAgent,
+            "name": "Phase Advisor",
+            "description": "Advises on next steps after legal-basis phase (attachments or proceed to drafting)"
+        },
     }
     
 
@@ -67,6 +77,8 @@ class AgentRegistry:
         "knowledge_qa": ["simple_qa", "comparison"],
         "more_content": ["simple_qa"],
         "context_reformulator": ["default"],
+        "legal_basis": ["extract_issues", "search_plan", "analysis", "defense", "update", "pleading"],
+        "phase_advisor": ["legal_basis_next_steps"],
     }
 
 

@@ -14,6 +14,7 @@ class ConversationStatus(str, Enum):
     WAITING_FOR_ATTACHMENTS = "waiting_for_attachments"
     CLAIM_DISCUSSION = "claim_discussion"
     CLAIM_DOCS_DISCUSSION = "claim_docs_discussion"
+    LEGAL_BASIS = "legal_basis"
     RESPONSE_DRAFTING = "response_drafting"
     RESPONSE_COMPLETED = "response_completed"
     CLOSED = "closed"

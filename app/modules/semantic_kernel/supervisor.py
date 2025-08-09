@@ -116,6 +116,12 @@ class Supervisor:
                 confidence = 1.0
                 reasoning = "Automatic routing due to claim_docs_discussion status"
                 prompt_type = "claim_docs_discussion"
+            elif conversation_status == "response_drafting":
+                logger.info("Conversation status is 'response_drafting' - routing to chat agent with final_qna prompt")
+                agent_type = "chat"
+                confidence = 1.0
+                reasoning = "Automatic routing due to response_drafting status (final Q&A)"
+                prompt_type = "final_qna"
             else:
                 # First analysis with all agents
                 analysis = await self.analyze_query(query, context)
@@ -213,7 +219,7 @@ class Supervisor:
             if prompt_type == "claim_discussion":
                 try:
                     from app.core.database import get_database
-                    db = get_database()
+                    db = await get_database()
                     conv_id = None
                     # Try to extract conversation_id from context messages metadata
                     if context:
@@ -238,11 +244,11 @@ class Supervisor:
                     logger.warning(f"Could not inject RAW_CLAIM_TEXT into claim_discussion prompt: {e}")
                     prompt = prompt.replace("{{RAW_CLAIM_TEXT}}", "(تعذر تحميل نص الدعوى المحفوظ)")
             
-            # For claim_docs_discussion, inject attachments raw text
+            # For claim_docs_discussion, inject claim raw text and attachments raw text
             if prompt_type == "claim_docs_discussion":
                 try:
                     from app.core.database import get_database
-                    db = get_database()
+                    db = await get_database()
                     conv_id = None
                     if context:
                         for msg in context:
@@ -250,8 +256,20 @@ class Supervisor:
                             if cid:
                                 conv_id = cid
                                 break
+                    if not conv_id and context and len(context) > 0:
+                        conv_id = context[-1].get("conversation_id")
+
                     if conv_id:
-                        # gather attachments texts
+                        doc = await db.statement_of_claim.find_one({"conversation_id": conv_id})
+                        raw_text = (doc or {}).get("raw_text")
+                        if raw_text:
+                            prompt = prompt.replace("{{RAW_CLAIM_TEXT}}", raw_text)
+                        else:
+                            prompt = prompt.replace("{{RAW_CLAIM_TEXT}}", "(لا يوجد نص مستخرج محفوظ لهذه القضية حتى الآن)")
+                    else:
+                        prompt = prompt.replace("{{RAW_CLAIM_TEXT}}", "(يتعذر تحديد المحادثة لاستخراج نص الدعوى)")
+
+                    if conv_id:
                         texts = []
                         cursor = db.attachments.find({"conversation_id": conv_id}).sort("created_at", 1)
                         async for att in cursor:
@@ -263,8 +281,58 @@ class Supervisor:
                     else:
                         prompt = prompt.replace("{{RAW_ATTACHMENTS_TEXT}}", "(يتعذر تحديد المحادثة لاستخراج نصوص المرفقات)")
                 except Exception as e:
-                    logger.warning(f"Could not inject RAW_ATTACHMENTS_TEXT: {e}")
+                    logger.warning(f"Could not inject RAW_CLAIM_TEXT/RAW_ATTACHMENTS_TEXT: {e}")
+                    prompt = prompt.replace("{{RAW_CLAIM_TEXT}}", "(تعذر تحميل نص الدعوى المحفوظ)")
                     prompt = prompt.replace("{{RAW_ATTACHMENTS_TEXT}}", "(تعذر تحميل نصوص المرفقات)")
+
+            # Inject data for final_qna (claim + attachments + latest final analysis)
+            if prompt_type == "final_qna":
+                try:
+                    from app.core.database import get_database
+                    db = await get_database()
+                    conv_id = None
+                    if context:
+                        for msg in context:
+                            cid = msg.get("conversation_id") or msg.get("message_data", {}).get("conversation_id")
+                            if cid:
+                                conv_id = cid
+                                break
+                    # Fallback: try last message ref
+                    if not conv_id and context and len(context) > 0:
+                        conv_id = context[-1].get("conversation_id")
+
+                    raw_claim = "(لا يوجد نص مستخرج محفوظ لهذه القضية حتى الآن)"
+                    raw_attachments = "(لا توجد مرفقات محفوظة)"
+                    final_analysis = "(لا يوجد تحليل نهائي محفوظ بعد)"
+
+                    if conv_id:
+                        doc = await db.statement_of_claim.find_one({"conversation_id": conv_id})
+                        if doc and doc.get("raw_text"):
+                            raw_claim = doc.get("raw_text")
+                        # attachments
+                        texts = []
+                        cursor = db.attachments.find({"conversation_id": conv_id}).sort("created_at", 1)
+                        async for att in cursor:
+                            t = (att.get("extracted_content", {}) or {}).get("raw_text", "")
+                            if t:
+                                texts.append(t[:2000])
+                        if texts:
+                            raw_attachments = "\n\n---\n".join(texts)
+                        # latest final analysis message
+                        from app.modules.message.service import MessageService
+                        ms = MessageService(db)
+                        messages = await ms.get_conversation_messages(conv_id, page=1, page_size=200)
+                        if messages and hasattr(messages, 'messages'):
+                            for m in reversed(messages.messages):
+                                md = m.message_data.get("metadata", {}) if isinstance(m.message_data, dict) else {}
+                                if md.get("query_type") == "legal_basis_final":
+                                    final_analysis = m.message_data.get("content", final_analysis)
+                                    break
+                    prompt = prompt.replace("{{RAW_CLAIM_TEXT}}", raw_claim)
+                    prompt = prompt.replace("{{RAW_ATTACHMENTS_TEXT}}", raw_attachments)
+                    prompt = prompt.replace("{{FINAL_ANALYSIS}}", final_analysis)
+                except Exception as e:
+                    logger.warning(f"Could not inject final_qna data: {e}")
 
             # Process the query with the selected agent
             agent = agent_class(settings=self.settings)
