@@ -67,9 +67,12 @@ class MessageService:
         self,
         conversation_id: str,
         page: int = 1,
-        page_size: int = 50
+        page_size: int = 50,
+        sort_desc: bool = False
     ) -> PaginatedMessageResponse:
-        """Get all messages for a conversation with pagination."""
+        """Get all messages for a conversation with pagination.
+        sort_desc=False returns oldest-first (ascending). When sort_desc=True, returns newest-first.
+        """
         try:
             if not ObjectId.is_valid(conversation_id):
                 raise ValueError("Invalid conversation ID format")
@@ -84,7 +87,14 @@ class MessageService:
             if limit < 0:
                 limit = 0
             
-            cursor = self.collection.find({"conversation_id": conversation_id}).skip(skip).limit(limit).sort("created_at", 1)
+            sort_dir = -1 if sort_desc else 1
+            cursor = (
+                self.collection
+                .find({"conversation_id": conversation_id})
+                .skip(skip)
+                .limit(limit)
+                .sort("created_at", sort_dir)
+            )
             
             messages = []
             async for message in cursor:

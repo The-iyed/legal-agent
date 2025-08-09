@@ -48,10 +48,11 @@ async def get_conversation_messages(
     conversation_id: str,
     page: int = Query(1, ge=1, description="Page number to retrieve"),
     page_size: int = Query(50, ge=1, le=100, description="Number of messages per page"),
+    newest_first: bool = Query(False, description="Return newest messages first if true"),
     message_service: MessageService = Depends(get_message_service)
 ):
     try:
-        return await message_service.get_conversation_messages(conversation_id, page, page_size)
+        return await message_service.get_conversation_messages(conversation_id, page, page_size, sort_desc=newest_first)
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

@@ -1133,28 +1133,24 @@ async def generate_legal_pleading(
         agent = agent_class(settings=agent_service.settings)
         pleading = await agent.generate_pleading(claim_text, attachments_merged, final_analysis, case_number, plaintiff_name)
 
-        # Store
-        await agent_service._store_agent_message(
-            pleading,
-            {"query_type": "pleading", "case_number": case_number},
-            conversation_id,
-            {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0}
-        )
-
-        # Force-write using MessageService as a safeguard
+        # Store once (idempotent): skip if the same pleading already exists for this conversation
+        stored_ok = False
         try:
-            agent_msg = MessageCreate(
-                conversation_id=conversation_id,
-                user_id=None,
-                message_data={
-                    "type": "agent_response",
-                    "content": pleading,
-                    "metadata": {"query_type": "pleading", "agent_type": "legal_basis", "prompt_type": "pleading"}
-                }
-            )
-            await agent_service.message_service.create_message(agent_msg)
-        except Exception as _:
-            pass
+            existing = await agent_service.message_service.collection.find_one({
+                "conversation_id": conversation_id,
+                "message_data.metadata.query_type": "pleading",
+                "message_data.content": pleading
+            })
+            if not existing:
+                await agent_service._store_agent_message(
+                    pleading,
+                    {"query_type": "pleading", "case_number": case_number},
+                    conversation_id,
+                    {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0}
+                )
+            stored_ok = True
+        except Exception:
+            stored_ok = False
 
         # Verify stored
         stored_ok = False
