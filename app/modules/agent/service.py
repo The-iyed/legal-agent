@@ -6,7 +6,7 @@ from app.schemas.agent import QueryResponse, FileUploadResponse, StatementOfClai
 from app.modules.semantic_kernel.supervisor import Supervisor
 from app.modules.message.service import MessageService
 from app.schemas.message import MessageCreate
-from app.schemas.conversation import ConversationStatus
+from app.schemas.conversation import ConversationStatus, ConversationUpdate
 from app.modules.conversation.status_manager import ConversationStatusManager
 from app.core.config.settings import get_settings
 from azure.storage.blob import BlobServiceClient
@@ -313,6 +313,38 @@ class AgentService:
             extracted_data = await self._convert_extraction_result_to_data(extraction_result)
             await self._store_statement_of_claim(conversation_id, extraction_result.file_url, extracted_data)
 
+            # Generate conversation title/description from extracted claim
+            try:
+                from app.modules.conversation.service import ConversationService
+                conversation_service = ConversationService(self.db)
+                claim = extraction_result.extracted_claim
+                # Title heuristic: case type + subject or number
+                title_parts = []
+                if getattr(claim, 'case_type', None):
+                    title_parts.append(str(claim.case_type))
+                if getattr(claim, 'case_subject', None):
+                    title_parts.append(str(claim.case_subject))
+                elif getattr(claim, 'case_number', None):
+                    title_parts.append(f"رقم {claim.case_number}")
+                title = " — ".join([p for p in title_parts if p]) or "دعوى جديدة"
+                # Description concise summary
+                desc_parts = []
+                if getattr(claim, 'plaintiff_name', None):
+                    desc_parts.append(f"المدعي: {claim.plaintiff_name}")
+                if getattr(claim, 'defendant_name', None):
+                    desc_parts.append(f"المدعى عليها: {claim.defendant_name}")
+                if getattr(claim, 'court_name', None):
+                    desc_parts.append(f"المحكمة: {claim.court_name}")
+                if getattr(claim, 'case_number', None):
+                    desc_parts.append(f"رقم الدعوى: {claim.case_number}")
+                description = "؛ ".join(desc_parts) or None
+                await conversation_service.update_conversation(
+                    conversation_id,
+                    ConversationUpdate(name=title, description=description)
+                )
+            except Exception as _:
+                pass
+
             # Cache the result for future identical files (both Redis and in-memory)
             if getattr(self, "_redis_cache", None):
                 try:
@@ -419,7 +451,23 @@ class AgentService:
                 data, url = res
                 attachment_results.append(data)
                 file_urls.append(url)
-                await self._store_file_upload_message(data["filename"], conversation_id, user_id)
+            
+            # Store a single aggregated message for all uploaded attachments
+            try:
+                attachments_short = [
+                    {"filename": a.get("filename"), "file_url": a.get("file_url"), "content_type": a.get("content_type"), "file_size": a.get("file_size")}
+                    for a in attachment_results
+                ]
+                names_list = ", ".join([a.get("filename") or "(بدون اسم)" for a in attachment_results])
+                aggregate_content = f"تم رفع المرفقات التالية: {names_list}"
+                await self._store_agent_message(
+                    aggregate_content,
+                    {"type": "attachments_uploaded", "attachments": attachments_short, "count": len(attachments_short)},
+                    conversation_id,
+                    {"agent_type": "attachment_uploader", "confidence": 1.0}
+                )
+            except Exception as e:
+                logger.warning(f"Failed to store aggregated attachments message: {e}")
             
             # 3. Append attachments into the existing statement_of_claim document
             try:
@@ -2168,6 +2216,7 @@ Create a detailed response with these sections:
             # Header (lawyerly, concise)
             response_parts.append("✅ تمت قراءة صحيفة الدعوى بنجاح.")
             response_parts.append("فيما يلي عرض مهني منظم لأهم ما ورد، يليه إبراز نقاط حساسة وخطوات عملية.")
+            response_parts.append("تنويه: نمثل الجهة المدعى عليها (مثل أمانة منطقة الرياض). سنعرض القراءة بمنظور دفاعي دون تبنّي مزاعم المدعي.")
             response_parts.append("")
             
             # Basic case information
@@ -2202,6 +2251,125 @@ Create a detailed response with these sections:
                     if len([c for c in line if c.isalnum()]) < 2:
                         continue
                     response_parts.append(f"  - {line}")
+            # الطلبات المقدمة - مقتبسة من بيانات الدعوى
+            response_parts.append("• الطلبات المقدمة كما وردت في صحيفة الدعوى:")
+            requests_lines = []
+
+            # اجمع النصوص المصدرية المحتملة
+            source_snippets: List[str] = []
+            if getattr(claim, 'case_requests', None):
+                source_snippets.append(claim.case_requests.strip())
+            reqs_text = ""
+            if extraction_result.raw_text:
+                try:
+                    from app.modules.claim_extractor.text_processor import TextProcessor as _TP
+                    sections = _TP().extract_saudi_legal_sections(extraction_result.raw_text)
+                    reqs_text = (sections or {}).get("requests_in_case", "").strip()
+                    if reqs_text:
+                        source_snippets.append(reqs_text)
+                except Exception:
+                    pass
+
+            # ضمّن النص الخام كاملاً لتمكين الاستخراج المباشر من الصحيفة
+            if extraction_result.raw_text:
+                source_snippets.append(extraction_result.raw_text.strip())
+            combined_sources = "\n".join([s for s in source_snippets if s])[:12000]
+
+            # حاول استخدام LLM لتنظيف/إعادة كتابة الطلبات باقتباس نص حرفي فقط
+            llm_items: List[str] = []
+            try:
+                if self.openai_processor and combined_sources:
+                    llm_prompt = f"""
+أنت مساعد قانوني. استخرج الطلبات المقدمة كما هي حرفياً من النص أدناه، دون صياغة جديدة أو إضافة معلومات.
+شروط صارمة:
+- استخدم اقتباساً حرفياً لجمل الطلبات من النص المصدر
+- لا تغيّر الكلمات أو ترتيبها، ولا تدمج جُملاً غير متجاورة
+- أزل العناوين العامة مثل: "الطلبات" أو "الطلبات المقدمة في القضية"
+- أزل رموز التعداد (• -) من البداية فقط
+- احذف التكرارات
+- حد أقصى 6 عناصر
+- أعد النتيجة كـ JSON Array فقط بدون أي نص آخر
+
+النص المصدر:
+{combined_sources}
+""".strip()
+                    llm_resp = self.openai_processor.chat.completions.create(
+                        model=self.azure_deployment_name,
+                        messages=[
+                            {"role": "system", "content": "دقيق وممتثل: أعد فقرات الطلبات باقتباس حرفي من النص فقط، بصيغة JSON Array من السلاسل."},
+                            {"role": "user", "content": llm_prompt}
+                        ],
+                        temperature=0.0,
+                        max_tokens=600
+                    )
+                    content = llm_resp.choices[0].message.content.strip()
+                    import json as _json
+                    # نظّف أسوار الشيفرة إن وجدت
+                    if content.startswith('```json'):
+                        content = content[7:]
+                    if content.endswith('```'):
+                        content = content[:-3]
+                    if content.startswith('```'):
+                        content = content[3:]
+                    if content.endswith('```'):
+                        content = content[:-3]
+                    items = _json.loads(content.strip())
+                    if isinstance(items, list):
+                        # تحقّق من أن كل عنصر موجود حرفياً في المصادر
+                        combined_lower = combined_sources
+                        validated = []
+                        for it in items:
+                            if not isinstance(it, str):
+                                continue
+                            cand = it.strip().lstrip('•- ').strip()
+                            if not cand:
+                                continue
+                            if cand in combined_lower:
+                                validated.append(cand)
+                            if len(validated) >= 6:
+                                break
+                        llm_items = validated
+            except Exception:
+                llm_items = []
+
+            if llm_items:
+                requests_lines = [f"  - {it}" for it in llm_items]
+            else:
+                # المسار الحتمي السابق
+                # من الحقول المنظمة
+                if getattr(claim, 'case_requests', None):
+                    req_text = claim.case_requests.strip()
+                    for line in [l.strip('-• \t') for l in req_text.split('\n') if l.strip()]:
+                        if len([c for c in line if c.isalnum()]) < 2:
+                            continue
+                        requests_lines.append(f"  - {line}")
+                    if not requests_lines:
+                        import re as _re
+                        parts = [p.strip() for p in _re.split(r'[،؛\.]', req_text) if p.strip()]
+                        for p in parts[:6]:
+                            requests_lines.append(f"  - {p}")
+                # من أقسام النص المستخرج
+                if not requests_lines and reqs_text:
+                    for line in [l.strip('-• ') for l in reqs_text.split('\n') if l.strip()]:
+                        if len(requests_lines) >= 6:
+                            break
+                        if "الطلبات" in line:
+                            continue
+                        requests_lines.append(f"  - {line}")
+                # من نظرة عامة
+                if not requests_lines and getattr(claim, 'claim_overview', None):
+                    ov = claim.claim_overview.strip()
+                    candidates = [l.strip('-• \t') for l in ov.split('\n') if l.strip()]
+                    for line in candidates:
+                        if any(kw in line for kw in ["الطلب", "طلبات", "إلغاء", "تعويض", "إلزام", "إيقاف", "إلغاء قرار"]):
+                            requests_lines.append(f"  - {line}")
+                            if len(requests_lines) >= 6:
+                                break
+
+            if requests_lines:
+                response_parts.extend(requests_lines)
+            else:
+                response_parts.append("  - غير مذكور صراحة في النص المستخرج.")
             response_parts.append("")
             
             # Declarations section extracted from OCR text (الإقرارات)
@@ -2233,20 +2401,22 @@ Create a detailed response with these sections:
             # Highlights
             response_parts.append("خامساً: نقاط بارزة تستحق الانتباه")
             highlights = []
-            if claim.plaintiff_name:
-                highlights.append("اسم المدعي مؤكد وثابت في الصحيفة.")
             if claim.case_subject:
-                highlights.append("موضوع الدعوى مذكور بوضوح، ما يسمح ببناء دفوع شكلية وموضوعية مناسبة.")
+                highlights.append("يمكن الدفع بعدم توافر الأساس النظامي للطلب كما صيغ في صحيفة الدعوى.")
             if claim.case_number:
-                highlights.append("رقم القضية متاح، ما يسهل الربط بالمستندات الإدارية.")
+                highlights.append("توثيق رقم القضية يمكّن من طلب السجل الإجرائي والقرارات ذات الصلة لدحض مزاعم المدعي.")
+            if claim.court_name:
+                highlights.append("اختصاص المحكمة قد يكون محلاً للدفع إن تبيّن تعلق النزاع بقرارات تنظيمية عامة.")
+            if getattr(claim, 'violation_number', None) or getattr(claim, 'decision_number', None):
+                highlights.append("يمكن طلب أصل القرار/المخالفة ومحاضر الضبط للتحقق من سلامة الإجراءات والاختصاص.")
             if not highlights:
-                highlights.append("لا توجد معلومات بارزة إضافية حالياً؛ سنعتمد على المرفقات لتعزيز القراءة.")
+                highlights.append("لا توجد نقاط بارزة إضافية حالياً؛ سيُبنى الدفاع وفق ما يُستكمل من مرفقات.")
             response_parts.extend([f"- {h}" for h in highlights])
             response_parts.append("")
 
             # Closing note (defense-oriented)
-            response_parts.append("سادساً: ملاحظة ختامية دفاعية")
-            response_parts.append("- سنبني دفوع الأمانة على ما ورد في الصحيفة وما يتوافر لاحقاً من مستندات، مع إبراز أي ثغرات شكلية أو موضوعية تُسهم في رفض طلبات المدعي.")
+            response_parts.append("سادساً: التوجيه الإجرائي للدفاع")
+            response_parts.append("- سنبني دفوع الجهة المدعى عليها على ما ورد في الصحيفة وما يُستكمل من مستندات، مع إبراز أي ثغرات شكلية أو موضوعية تُسهم في رفض طلبات المدعي.")
              
             return "\n".join(response_parts)
             

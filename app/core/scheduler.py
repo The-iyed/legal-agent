@@ -296,22 +296,23 @@ class TaskScheduler:
         self.db = db
         self.conversation_name_generator = ConversationNameGenerator(db, self.settings)
         
-        self.scheduler.add_job(
-            func=self.conversation_name_generator.run_name_generation_job,
-            trigger=CronTrigger(minute="*/5"), 
-            id="conversation_name_generation",
-            name="Generate Conversation Names",
-            replace_existing=True,
-            max_instances=1  
-        )
+        # Disable automatic conversation name generation job per product requirement
+        # self.scheduler.add_job(
+        #     func=self.conversation_name_generator.run_name_generation_job,
+        #     trigger=CronTrigger(minute="*/5"), 
+        #     id="conversation_name_generation",
+        #     name="Generate Conversation Names",
+        #     replace_existing=True,
+        #     max_instances=1  
+        # )
         
-        logger.info("📅 Task scheduler initialized with conversation name generation job")
+        logger.info("📅 Task scheduler initialized (conversation name generation job disabled)")
     
     def start(self):
         """Start the scheduler."""
         try:
-            self.scheduler.start()
-            logger.info("🚀 Task scheduler started successfully")
+            # self.scheduler.start()
+            logger.info("🚀 Task scheduler start skipped (no jobs enabled)")
         except Exception as e:
             logger.error(f"❌ Failed to start task scheduler: {str(e)}")
     

@@ -62,6 +62,20 @@ class LegalBasisAgent(BaseAgent):
     async def generate_pleading(self, claim_text: str, attachments_text: str, final_analysis: str, case_number: str = "" , plaintiff_name: str = "") -> str:
         """Generate a formal legal pleading memo based on claim, attachments, and final analysis."""
         prompt = self.prompt_manager.get_prompt("legal_basis", "pleading") or self.prompts.get("analysis", "")
+        # Extract defendant name from claim_text when possible (simple heuristics)
+        defendant_name = "وزارة البلديات والإسكان/الأمانة"
+        try:
+            import re as _re
+            # Common Arabic label patterns
+            m = _re.search(r"(?:المدعى\s+عليه|المدعى\s+عليها|الجهة\s+المدعى\s+عليها)\s*[:：]?\s*([^\n\r]+)", claim_text or "", flags=_re.IGNORECASE)
+            if m:
+                cand = m.group(1).strip()
+                # Clean trailing punctuation
+                cand = _re.sub(r"[\s\-–—:,]+$", "", cand)
+                if 2 <= len(cand) <= 120:
+                    defendant_name = cand
+        except Exception:
+            pass
         prompt = (
             prompt
             .replace("{{CLAIM_TEXT}}", claim_text or "")
@@ -69,6 +83,7 @@ class LegalBasisAgent(BaseAgent):
             .replace("{{FINAL_ANALYSIS}}", final_analysis or "")
             .replace("{{CASE_NUMBER}}", case_number or "—")
             .replace("{{PLAINTIFF_NAME}}", plaintiff_name or "—")
+            .replace("{{DEFENDANT_NAME}}", defendant_name)
         )
         return await self._process_query([{"role": "system", "content": prompt}])
 
@@ -127,19 +142,21 @@ class LegalBasisAgent(BaseAgent):
                 logger.warning(f"LegalBasisAgent: search failed for '{q}': {e}")
         return results[:20]
 
-    async def _stage_analysis(self, claim_text: str, attachments_text: str, issues: str, laws: List[Dict[str, Any]]) -> str:
+    async def _stage_analysis(self, claim_text: str, attachments_text: str, issues: str, laws: List[Dict[str, Any]], attachment_filenames: Optional[List[str]] = None) -> str:
         laws_snippets = []
         for i, r in enumerate(laws[:12], 1):
             title = r.get("legislation_title") or r.get("document_name") or "(بدون عنوان)"
             content = r.get("content", "")
             laws_snippets.append(f"[{i}] {title}:\n{content}")
         laws_block = "\n\n".join(laws_snippets)
+        filenames_block = "\n".join(attachment_filenames or [])
         prompt = (
             self.prompts["analysis"]
             .replace("{{CLAIM_TEXT}}", claim_text)
             .replace("{{ATTACHMENTS_TEXT}}", attachments_text)
             .replace("{{ISSUES}}", issues)
             .replace("{{LAWS}}", laws_block)
+            .replace("{{ATTACHMENT_FILENAMES}}", filenames_block)
         )
         return await self._process_query([{"role": "system", "content": prompt}])
 
@@ -161,22 +178,27 @@ class LegalBasisAgent(BaseAgent):
         return await self._process_query([{"role": "system", "content": system_prompt}])
 
     async def execute_without_search(self, query: str, prompt: str, context: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-        """Run legal-basis analysis without using Azure AI Search (no external retrieval)."""
+        """Run legal-basis analysis without using Azure Search (no external retrieval)."""
         try:
             claim_text = ""
             attachments_text = ""
+            attachment_filenames: List[str] = []
             if isinstance(context, list):
                 for item in context:
                     if item.get("_key") == "claim_text":
                         claim_text = item.get("_value", "")
                     if item.get("_key") == "attachments_text":
                         attachments_text = item.get("_value", "")
+                    if item.get("_key") == "attachment_filenames":
+                        val = item.get("_value")
+                        if isinstance(val, list):
+                            attachment_filenames = [str(v) for v in val if v]
             # Extract issues from provided texts only
             issues = await self._stage_extract_issues(claim_text, attachments_text)
             # Skip planning and search; use empty laws list
             laws: List[Dict[str, Any]] = []
             # Core analysis and defense without citations
-            analysis = await self._stage_analysis(claim_text, attachments_text, issues, laws)
+            analysis = await self._stage_analysis(claim_text, attachments_text, issues, laws, attachment_filenames)
             defense = await self._stage_defense(analysis, laws)
             response = (
                 "🎯 الأساس القانوني للدعوى (ملخص منظم)\n\n" + analysis.strip() + "\n\n"
@@ -191,6 +213,7 @@ class LegalBasisAgent(BaseAgent):
         try:
             claim_text = ""
             attachments_text = ""
+            attachment_filenames: List[str] = []
             # Expect claim_text and attachments_text via context with special keys if provided
             if isinstance(context, list):
                 for item in context:
@@ -198,10 +221,14 @@ class LegalBasisAgent(BaseAgent):
                         claim_text = item.get("_value", "")
                     if item.get("_key") == "attachments_text":
                         attachments_text = item.get("_value", "")
+                    if item.get("_key") == "attachment_filenames":
+                        val = item.get("_value")
+                        if isinstance(val, list):
+                            attachment_filenames = [str(v) for v in val if v]
             issues = await self._stage_extract_issues(claim_text, attachments_text)
             queries = await self._stage_search_plan(issues)
             laws = await self._search_laws(queries)
-            analysis = await self._stage_analysis(claim_text, attachments_text, issues, laws)
+            analysis = await self._stage_analysis(claim_text, attachments_text, issues, laws, attachment_filenames)
             defense = await self._stage_defense(analysis, laws)
             # Sanitize to avoid duplicated markdown blocks or fenced code
             analysis = self._sanitize_output(analysis)

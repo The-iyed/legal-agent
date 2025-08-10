@@ -57,12 +57,14 @@ class PyObjectId(str):
 
 class ConversationBase(BaseModel):
     name: str
+    description: Optional[str] = Field(default=None, description="Short description of the conversation (auto-generated from claim)")
     status: ConversationStatus = Field(default=ConversationStatus.WAITING_FOR_CLAIM, description="Current status of the conversation")
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
                 "name": "New Conversation",
+                "description": "ملخص الدعوى: طلب إلغاء مخالفة بلدية رقم 123456.",
                 "status": "waiting_for_claim"
             }
         }
@@ -75,6 +77,7 @@ class ConversationCreate(ConversationBase):
         json_schema_extra={
             "example": {
                 "name": "New Conversation",
+                "description": "ملخص موجز سيملأ لاحقاً بعد رفع الصحيفة.",
                 "user_id": "user123"
             }
         }
@@ -82,12 +85,14 @@ class ConversationCreate(ConversationBase):
 
 class ConversationUpdate(BaseModel):
     name: Optional[str] = None
+    description: Optional[str] = None
     status: Optional[ConversationStatus] = None
 
     model_config = ConfigDict(
         json_schema_extra={
             "example": {
-                "name": "Updated Conversation Name",
+                "name": "دعوى إلغاء مخالفة",
+                "description": "رقم الدعوى 123؛ المدعي فلان؛ المدعى عليها الأمانة؛ المحكمة الإدارية بالرياض.",
                 "status": "claim_uploaded"
             }
         }
@@ -103,7 +108,8 @@ class ConversationResponse(ConversationBase):
         json_schema_extra={
             "example": {
                 "_id": "507f1f77bcf86cd799439011",
-                "name": "New Conversation",
+                "name": "دعوى إلغاء مخالفة",
+                "description": "رقم الدعوى 123؛ المدعي فلان؛ المدعى عليها الأمانة؛ المحكمة الإدارية بالرياض.",
                 "user_id": "user123",
                 "status": "waiting_for_claim",
                 "created_at": "2024-03-20T10:00:00Z"
@@ -122,6 +128,7 @@ class ConversationList(BaseModel):
                     {
                         "_id": "507f1f77bcf86cd799439011",
                         "name": "New Conversation",
+                        "description": "ملخص الدعوى",
                         "user_id": "user123",
                         "created_at": "2024-03-20T10:00:00Z"
                     }
@@ -142,6 +149,7 @@ class PaginatedConversationResponse(BaseModel):
                     {
                         "_id": "507f1f77bcf86cd799439011",
                         "name": "New Conversation",
+                        "description": "ملخص الدعوى",
                         "user_id": "user123",
                         "created_at": "2024-03-20T10:00:00Z"
                     }

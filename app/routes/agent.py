@@ -648,17 +648,21 @@ async def analyze_legal_basis(
         # Fetch attachments text and merge
         db = agent_service.db
         attachments_texts = []
+        attachments_meta = []  # filename + raw_text for lightweight citation
         cursor = db.attachments.find({"conversation_id": request.conversation_id}).sort("created_at", 1)
         async for att in cursor:
             t = ((att.get("extracted_content", {}) or {}).get("raw_text", "") or "").strip()
             if t:
                 attachments_texts.append(t)
+            fn = att.get("filename") or ((att.get("file_url", "") or "").split("/")[-1] if att.get("file_url") else "")
+            attachments_meta.append({"filename": fn, "raw_text": t})
         attachments_merged = "\n\n---\n".join(attachments_texts)
 
         # Build context for agent
         context = [
             {"_key": "claim_text", "_value": claim_text},
-            {"_key": "attachments_text", "_value": attachments_merged}
+            {"_key": "attachments_text", "_value": attachments_merged},
+            {"_key": "attachment_filenames", "_value": [a.get("filename") for a in attachments_meta if a.get("filename")]}
         ]
 
         # Run LegalBasisAgent WITHOUT Azure Search
@@ -708,36 +712,114 @@ async def analyze_legal_basis(
                 if miss_line:
                     miss_val = miss_line.group(1).strip()
                     if miss_val and miss_val.lower() != "<names>" and miss_val != "":
-                        missing = [x.strip() for x in miss_val.split(',') if x.strip()]
-                # Remove the block from the user-facing content
+                        missing = [x.strip() for x in miss_val.split(',') if x.strip()] 
                 content = re.sub(r"\[attachments_status\].*?\[/attachments_status\]", "", content, flags=re.DOTALL|re.IGNORECASE).strip()
         except Exception:
             has_all = None
 
-        # Store agent message in conversation history
+        # Inject inline citations where lines likely rely on specific attachments
+        inline_citations = []
+        try:
+            if content and attachments_meta:
+                import re as _re
+                domain_keywords = [
+                    "قرار", "المخالفة", "مخالفة", "محضر", "السجل", "سجل", "عقد", "ترخيص", "تصريح",
+                    "فاتورة", "تقرير", "صورة", "صور", "مراسلات", "خطاب", "إفادة", "بيان"
+                ]
+                lines = content.split("\n")
+                used_line_idxs = set()
+                for att in attachments_meta:
+                    fname = (att.get("filename") or "").strip()
+                    if not fname:
+                        continue
+                    base = fname.rsplit('.', 1)[0]
+                    tokens = [tok for tok in _re.split(r"[\s_\-]+", base) if len(tok) >= 3]
+                    raw_text = att.get("raw_text") or ""
+                    att_kws = [kw for kw in domain_keywords if kw in raw_text]
+                    search_terms = tokens + att_kws
+                    cites_for_this = 0
+                    if not search_terms:
+                        continue
+                    for idx, line in enumerate(lines):
+                        if cites_for_this >= 2:
+                            break
+                        if idx in used_line_idxs:
+                            continue
+                        striped = line.strip()
+                        if len(striped) < 6 or "حسب" in striped:
+                            continue
+                        if any(term in striped for term in search_terms):
+                            lines[idx] = line.rstrip() + f" — **حسب {fname}**"
+                            inline_citations.append({"line": idx, "attachment": fname})
+                            used_line_idxs.add(idx)
+                            cites_for_this += 1
+                content = "\n".join(lines)
+        except Exception:
+            inline_citations = []
+
+        # Build attachment citations (حسب <filename>) heuristically from content
+        try:
+            citations = []
+            if content and attachments_meta:
+                import re as _re
+                for a in attachments_meta:
+                    fname = (a.get("filename") or "").strip()
+                    if not fname:
+                        continue
+                    base = fname.rsplit('.', 1)[0]
+                    tokens = [tok for tok in _re.split(r"[\s_\-]+", base) if len(tok) >= 3]
+                    # Simple keyword boost
+                    if any(kw in content for kw in tokens):
+                        citations.append(fname)
+                # De-duplicate while preserving order
+                seen = set()
+                citations = [x for x in citations if not (x in seen or seen.add(x))][:8]
+                if citations:
+                    content += "\n\n**المراجع (حسب المرفقات):**\n" + "\n".join([f"- **حسب {c}**" for c in citations])
+        except Exception:
+            citations = []
+
+        # Derive recommended attachments that strengthen defense (always produce some)
+        try:
+            recommended = []
+            # Prefer LLM-parsed 'missing' list from attachments_status block
+            if missing:
+                recommended = missing[:]
+            # Heuristics from claim text if empty
+            if not recommended:
+                text = (claim_text or "")
+                if any(x in text for x in ["قرار", "التظلم", "قرار إداري"]):
+                    recommended.append("أصل القرار الإداري")
+                if "مخالفة" in text:
+                    recommended.append("محضر الضبط وصور المخالفة")
+                if any(x in text for x in ["سجل", "تجاري"]):
+                    recommended.append("صورة السجل التجاري")
+                if any(x in text for x in ["ترخيص", "تصريح"]):
+                    recommended.append("صورة الرخصة/التصريح")
+                if any(x in text for x in ["عقد", "اتفاق"]):
+                    recommended.append("نسخة العقد وملحقاته")
+                if not recommended:
+                    recommended = ["قرار الجهة", "محضر ضبط", "مراسلات رسمية"]
+            # Optionally add a short section to the content
+            if recommended:
+                rec_lines = "\n".join([f"- {r}" for r in recommended[:6]])
+                content += f"\n\n**مرفقات مقترحة لتعزيز موقف الجهة:**\n{rec_lines}"
+        except Exception:
+            recommended = []
+
+        # Store agent message in conversation history (content produced by defense-oriented prompts)
         try:
             await agent_service._store_agent_message(
                 content,
-                {"query_type": "legal_basis", "retrieval": "none", "attachments_status": ("all" if has_all else ("missing" if has_all is False else "unknown")), "missing": missing},
+                {"query_type": "legal_basis", "retrieval": "none", "attachments_status": ("all" if has_all else ("missing" if has_all is False else "unknown")), "missing": missing, "attachment_citations": citations, "inline_citations": inline_citations, "recommended_attachments": recommended},
                 request.conversation_id,
                 {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0, "reasoning": "legal basis analysis without search"}
             )
         except Exception as e:
             logger.warning(f"Failed to store legal basis message: {e}")
 
-        # Always ask for attachments explicitly; do not auto‑finalize here
-        req_text = "نحتاج إلى استكمال المرفقات الداعمة قبل الانتقال للمرحلة التالية."
-        if missing:
-            req_text += "\nالمرفقات المطلوبة: " + ", ".join(missing)
-        req_text += "\nالرجاء رفعها عبر مسار: POST /agents/legal-basis/attachments-or-proceed، أو أبلغني أنك لا تملكها لنكمل بما لدينا." 
-        await agent_service._store_agent_message(
-            req_text,
-            {"query_type": "attachments_requirements", "missing": missing},
-            request.conversation_id,
-            {"agent_type": "chat", "prompt_type": "waiting_for_attachments", "confidence": 1.0}
-        )
-        combined = content + "\n\n" + req_text
-        return {"response": combined, "metadata": {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0}}
+        # Return analysis content only (no attachment request message)
+        return {"response": content, "metadata": {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0, "attachment_citations": citations, "inline_citations": inline_citations, "recommended_attachments": recommended}}
 
     except HTTPException:
         raise
@@ -957,7 +1039,7 @@ async def orient_to_legal_basis(
 async def legal_basis_attachments_or_proceed(
     conversation_id: str = Form(..., description="Conversation ID"),
     proceed: bool = Form(False, description="Set true to proceed without uploading files"),
-    files: Optional[Union[UploadFile, List[UploadFile]]] = File(None, description="Attachment files to upload (single or multiple)"),
+    files: List[UploadFile] = File(None, description="Attachment files to upload (single or multiple)"),
     agent_service: AgentService = Depends(get_agent_service),
     conversation_service: ConversationService = Depends(get_conversation_service)
 ):
@@ -968,12 +1050,8 @@ async def legal_basis_attachments_or_proceed(
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
-        # Normalize files: accept single or list, drop empty
-        if files:
-            if isinstance(files, UploadFile):
-                files = [files]
-            else:
-                files = [f for f in files if getattr(f, "filename", None)]
+        # Normalize files: drop empty
+        files = [f for f in (files or []) if getattr(f, "filename", None)]
 
         # Case 1: user uploaded attachments → process and rerun legal basis
         if files and len(files) > 0:
@@ -983,6 +1061,25 @@ async def legal_basis_attachments_or_proceed(
 
             # Process attachments
             attach_result = await agent_service.process_attachments(files, conversation_id, user_id="system")
+            # Store a single aggregated message for UI with filenames and links
+            try:
+                from urllib.parse import urlparse
+                # Try extracting attachment info from DB (latest by conversation)
+                db = agent_service.db
+                atts = []
+                cursor = db.attachments.find({"conversation_id": conversation_id}).sort("created_at", -1).limit(len(files))
+                async for a in cursor:
+                    atts.append({"filename": a.get("filename"), "file_url": a.get("file_url")})
+                names = ", ".join([a.get("filename") or "(بدون اسم)" for a in atts])
+                content_agg = f"تم رفع المرفقات التالية: {names}"
+                await agent_service._store_agent_message(
+                    content_agg,
+                    {"type": "attachments_uploaded", "attachments": atts, "count": len(atts)},
+                    conversation_id,
+                    {"agent_type": "attachment_uploader", "confidence": 1.0}
+                )
+            except Exception:
+                pass
 
             # Re-run legal basis analysis with full claim + new attachments
             class _LBReq(BaseModel):
@@ -990,14 +1087,24 @@ async def legal_basis_attachments_or_proceed(
                 user_id: Optional[str] = None
             lb_req = _LBReq(conversation_id=conversation_id)
             result = await analyze_legal_basis(lb_req, agent_service, conversation_service)  # reuse route logic
-            return result
+            # Ensure citations/recommendations bubble through
+            try:
+                md = result.get("metadata", {}) if isinstance(result, dict) else {}
+                content = result.get("response", "") if isinstance(result, dict) else ""
+                cites = md.get("attachment_citations", [])
+                recs = md.get("recommended_attachments", [])
+                if cites:
+                    content += "\n\n**المراجع (حسب المرفقات):**\n" + "\n".join([f"- **حسب {c}**" for c in cites])
+                if recs:
+                    content += "\n\n**مرفقات مقترحة لتعزيز موقف الجهة:**\n" + "\n".join([f"- {r}" for r in recs])
+                return {"response": content, "metadata": md}
+            except Exception:
+                return result
 
-        # Case 2: no attachments. If proceed flag set → update status and orient/proceed
+
         if proceed:
-            # Update status to RESPONSE_DRAFTING as next phase for document drafting
-            await conversation_service.update_conversation_status(conversation_id, ConversationStatus.RESPONSE_DRAFTING)
 
-            # Confirm proceeding without asking again
+            await conversation_service.update_conversation_status(conversation_id, ConversationStatus.RESPONSE_DRAFTING)
             content = (
                 "تم تأكيد انتقالك إلى المرحلة التالية.\n\n"
                 "سنبدأ الآن في تحليل القضايا القانونية وإعداد الاعتراضات ثم مناقشة صياغة الوثائق القانونية بناءً على النتائج الحالية."
@@ -1012,7 +1119,6 @@ async def legal_basis_attachments_or_proceed(
 
             return {"response": content, "metadata": {"agent_type": "chat", "prompt_type": "default", "confidence": 1.0}}
 
-        # Case 3: neither files nor proceed → Ask the question via advisor
         from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry
         registry = AgentRegistry()
         advisor_class = registry.get_agent_class("phase_advisor")
