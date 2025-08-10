@@ -82,6 +82,7 @@ class FileUploadResponse(BaseModel):
     case_number: Optional[str] = None
     is_valid: bool
     metadata: dict[str, Any]
+    attachments: Optional[List[dict[str, Any]]] = None  # [{name, link, size}]
 
     model_config = ConfigDict(
         json_schema_extra={
@@ -95,7 +96,11 @@ class FileUploadResponse(BaseModel):
                     "validation_score": 0.78,
                     "validation_errors": [],
                     "total_pages": 1
-                }
+                },
+                "attachments": [
+                    {"name": "عقد إيجار.pdf", "link": "https://.../a.pdf", "size": 123456},
+                    {"name": "محضر ضبط.pdf", "link": "https://.../b.pdf", "size": 234567}
+                ]
             }
         }
     )

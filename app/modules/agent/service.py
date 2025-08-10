@@ -315,35 +315,21 @@ class AgentService:
 
             # Generate conversation title/description from extracted claim
             try:
-                from app.modules.conversation.service import ConversationService
-                conversation_service = ConversationService(self.db)
+                from bson import ObjectId
                 claim = extraction_result.extracted_claim
-                # Title heuristic: case type + subject or number
-                title_parts = []
-                if getattr(claim, 'case_type', None):
-                    title_parts.append(str(claim.case_type))
-                if getattr(claim, 'case_subject', None):
-                    title_parts.append(str(claim.case_subject))
-                elif getattr(claim, 'case_number', None):
-                    title_parts.append(f"رقم {claim.case_number}")
-                title = " — ".join([p for p in title_parts if p]) or "دعوى جديدة"
-                # Description concise summary
-                desc_parts = []
-                if getattr(claim, 'plaintiff_name', None):
-                    desc_parts.append(f"المدعي: {claim.plaintiff_name}")
-                if getattr(claim, 'defendant_name', None):
-                    desc_parts.append(f"المدعى عليها: {claim.defendant_name}")
-                if getattr(claim, 'court_name', None):
-                    desc_parts.append(f"المحكمة: {claim.court_name}")
-                if getattr(claim, 'case_number', None):
-                    desc_parts.append(f"رقم الدعوى: {claim.case_number}")
-                description = "؛ ".join(desc_parts) or None
-                await conversation_service.update_conversation(
-                    conversation_id,
-                    ConversationUpdate(name=title, description=description)
+                # Compose human-readable title and description
+                title, description = self._compose_conversation_title_desc(claim)
+                update_doc = {"name": title, "description": description}
+                result = await self.db.conversations.update_one(
+                    {"_id": ObjectId(conversation_id)},
+                    {"$set": update_doc}
                 )
-            except Exception as _:
-                pass
+                if result.modified_count == 0:
+                    logger.warning(f"Conversation {conversation_id} title/description update had no effect")
+                else:
+                    logger.info(f"Conversation {conversation_id} title set to '{title}'")
+            except Exception as e:
+                logger.warning(f"Failed to update conversation title/description: {e}")
 
             # Cache the result for future identical files (both Redis and in-memory)
             if getattr(self, "_redis_cache", None):
@@ -490,10 +476,15 @@ class AgentService:
             
             # 5. Extract case number from original claim
             case_number = self._extract_case_number(claim_data)
+            # Build structured attachments list for client UI
+            attachments_struct = [
+                {"name": a.get("filename"), "link": a.get("file_url"), "size": a.get("file_size")}
+                for a in attachment_results
+            ]
             
             return FileUploadResponse(
                 response=overview_response,
-                file_url=", ".join(file_urls) if file_urls else None,  # Multiple URLs joined or None
+                file_url=", ".join(file_urls) if file_urls else None,  # legacy
                 case_number=case_number,
                 is_valid=True,
                 metadata={
@@ -501,7 +492,8 @@ class AgentService:
                     "claim_document_type": claim_data.get("document_type", "unknown"),
                     "total_attachments_size": total_size,
                     "attachment_types": attachment_types
-                }
+                },
+                attachments=attachments_struct
             )
             
         except Exception as e:
@@ -2371,8 +2363,7 @@ Create a detailed response with these sections:
             else:
                 response_parts.append("  - غير مذكور صراحة في النص المستخرج.")
             response_parts.append("")
-            
-            # Declarations section extracted from OCR text (الإقرارات)
+             
             response_parts.append("**رابعاً: الإقرارات**")
             response_parts.append("• الإقرارات الموجودة في صحيفة الدعوى:")
             declarations_lines = []
@@ -2452,3 +2443,77 @@ Create a detailed response with these sections:
         except Exception as e:
             logger.error(f"Error appending attachments to claim: {e}")
             raise
+
+    def _compose_conversation_title_desc(self, claim) -> tuple[str, str]:
+  
+        try:
+            # Title
+            parts = []
+            case_type = (getattr(claim, "case_type", None) or "").strip()
+            case_subject = (getattr(claim, "case_subject", None) or "").strip()
+            case_number = (getattr(claim, "case_number", None) or "").strip()
+            if case_type:
+                parts.append(case_type)
+            if case_subject:
+                parts.append(case_subject)
+            elif case_number:
+                parts.append(f"رقم {case_number}")
+            title = " — ".join([p for p in parts if p]) or "دعوى جديدة"
+
+            # Description base by type
+            t_norm = case_type.replace("ة", "ه")
+            if "تجار" in t_norm:
+                base = "نزاع تجاري"
+            elif "ادار" in t_norm:
+                base = "نزاع إداري"
+            elif "مدن" in t_norm:
+                base = "نزاع مدني"
+            elif "جنائ" in t_norm:
+                base = "قضية جنائية"
+            else:
+                base = "نزاع"
+
+            # Parties phrase
+            p = (getattr(claim, "plaintiff_name", "") or "").strip()
+            d = (getattr(claim, "defendant_name", "") or "").strip()
+            def _ptype(name: str) -> str:
+                if not name:
+                    return "طرف"
+                if "شركة" in name:
+                    return "شركة"
+                if "مؤسسة" in name:
+                    return "مؤسسة"
+                if any(k in name for k in ["وزارة", "أمانة", "أمانه", "بلدية", "هيئة", "جهة"]):
+                    return "جهة حكومية"
+                return "طرف"
+            pt, dt = _ptype(p), _ptype(d)
+            if pt in ["شركة", "مؤسسة"] and dt in ["شركة", "مؤسسة"]:
+                parties = "بين شركتين" if pt == "شركة" and dt == "شركة" else "بين جهتين"
+            elif "جهة حكومية" in (pt, dt):
+                parties = "بين جهة حكومية وطرف آخر"
+            elif pt == dt:
+                parties = "بين طرفين"
+            else:
+                parties = "بين طرفين"
+
+            # Subject hint
+            subject_hint = ""
+            subj = case_subject
+            if subj:
+                if "إلغاء" in subj and "قرار" in subj:
+                    subject_hint = " حول إلغاء قرار إداري"
+                elif "تعويض" in subj:
+                    subject_hint = " بشأن مطالبة تعويض"
+                elif "مخالفة" in subj:
+                    subject_hint = " بشأن مخالفة بلدية"
+                elif any(k in subj for k in ["عقد", "إيجار", "بيع"]):
+                    subject_hint = " بشأن عقد"
+
+            description = f"{base} {parties}{subject_hint}".strip()
+            # Keep it short
+            if len(description) > 64:
+                description = description[:64].rstrip()
+            return title, description
+        except Exception as e:
+            logger.warning(f"_compose_conversation_title_desc failed: {e}")
+            return "دعوى جديدة", "نزاع بين طرفين"
