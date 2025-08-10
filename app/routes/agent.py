@@ -14,7 +14,7 @@ from typing import Optional, Any, List, Union
 from pydantic import BaseModel, ConfigDict
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.routes.message import get_message_service
-from app.schemas.conversation import ConversationStatus
+from app.schemas.conversation import ConversationStatus, ConversationUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -644,6 +644,55 @@ async def analyze_legal_basis(
         # Fetch full claim text
         claim_doc = await agent_service.get_statement_of_claim(request.conversation_id)
         claim_text = (claim_doc or {}).get("raw_text", "")
+        # If conversation title/description are default/null, try to set them from stored extracted fields
+        try:
+            conv = await conversation_service.get_conversation(request.conversation_id)
+            needs_update = (not conv.description) or (conv.name in ["محادثة جديدة", "قضية جديدة", "New Conversation"]) 
+            if needs_update and claim_doc:
+                claim = claim_doc
+                case_type = (claim.get("case_type") or claim.get("caseDetails", {}).get("case_type") or "").strip()
+                case_subject = (claim.get("case_subject") or "").strip()
+                case_number = (claim.get("case_number") or "").strip()
+                parts = []
+                if case_type:
+                    parts.append(case_type)
+                if case_subject:
+                    parts.append(case_subject)
+                elif case_number:
+                    parts.append(f"رقم {case_number}")
+                title = " — ".join([p for p in parts if p]) or "قضية"
+                # description short
+                def _ptype(name: str) -> str:
+                    if not name:
+                        return "طرف"
+                    if "شركة" in name:
+                        return "شركة"
+                    if "مؤسسة" in name:
+                        return "مؤسسة"
+                    if any(k in name for k in ["وزارة", "أمانة", "بلدية", "هيئة", "جهة"]):
+                        return "جهة حكومية"
+                    return "طرف"
+                p = (claim.get("plaintiff_name") or "").strip()
+                d = (claim.get("defendant_name") or "").strip()
+                pt, dt = _ptype(p), _ptype(d)
+                if pt in ["شركة", "مؤسسة"] and dt in ["شركة", "مؤسسة"]:
+                    party = "بين شركتين" if pt == "شركة" and dt == "شركة" else "بين جهتين"
+                elif "جهة حكومية" in (pt, dt):
+                    party = "بين جهة حكومية وطرف آخر"
+                else:
+                    party = "بين طرفين"
+                base = "نزاع"
+                t_norm = case_type.replace("ة", "ه")
+                if "تجار" in t_norm:
+                    base = "نزاع تجاري"
+                elif "ادار" in t_norm:
+                    base = "نزاع إداري"
+                elif "مدن" in t_norm:
+                    base = "نزاع مدني"
+                description = f"{base} {party}"
+                await conversation_service.update_conversation(request.conversation_id, ConversationUpdate(name=title, description=description))
+        except Exception:
+            pass
 
         # Fetch attachments text and merge
         db = agent_service.db
@@ -1061,16 +1110,38 @@ async def legal_basis_attachments_or_proceed(
 
             # Process attachments
             attach_result = await agent_service.process_attachments(files, conversation_id, user_id="system")
+            # Ensure conversation title/description are set if still default
+            try:
+                conv = await conversation_service.get_conversation(conversation_id)
+                needs_update = (not conv.description) or (conv.name in ["محادثة جديدة", "قضية جديدة", "New Conversation"]) 
+                if needs_update:
+                    claim_doc = await agent_service.get_statement_of_claim(conversation_id)
+                    claim = claim_doc or {}
+                    case_type = (claim.get("case_type") or "").strip()
+                    case_subject = (claim.get("case_subject") or "").strip()
+                    case_number = (claim.get("case_number") or "").strip()
+                    parts = []
+                    if case_type:
+                        parts.append(case_type)
+                    if case_subject:
+                        parts.append(case_subject)
+                    elif case_number:
+                        parts.append(f"رقم {case_number}")
+                    title = " — ".join([p for p in parts if p]) or "قضية"
+                    description = "نزاع بين طرفين" if not case_type else ("نزاع تجاري" if "تجار" in case_type else ("نزاع إداري" if "ادار" in case_type else "نزاع"))
+                    await conversation_service.update_conversation(conversation_id, ConversationUpdate(name=title, description=description))
+            except Exception:
+                pass
+
             # Store a single aggregated message for UI with filenames and links
             try:
-                from urllib.parse import urlparse
                 # Try extracting attachment info from DB (latest by conversation)
                 db = agent_service.db
-                atts = []
+                atts = []  # [{name, link, size}]
                 cursor = db.attachments.find({"conversation_id": conversation_id}).sort("created_at", -1).limit(len(files))
                 async for a in cursor:
-                    atts.append({"filename": a.get("filename"), "file_url": a.get("file_url")})
-                names = ", ".join([a.get("filename") or "(بدون اسم)" for a in atts])
+                    atts.append({"name": a.get("filename"), "link": a.get("file_url"), "size": a.get("file_size")})
+                names = ", ".join([a.get("name") or "(بدون اسم)" for a in atts])
                 content_agg = f"تم رفع المرفقات التالية: {names}"
                 await agent_service._store_agent_message(
                     content_agg,
@@ -1093,6 +1164,8 @@ async def legal_basis_attachments_or_proceed(
                 content = result.get("response", "") if isinstance(result, dict) else ""
                 cites = md.get("attachment_citations", [])
                 recs = md.get("recommended_attachments", [])
+                # Include structured attachments list for client UI
+                md["attachments"] = atts
                 if cites:
                     content += "\n\n**المراجع (حسب المرفقات):**\n" + "\n".join([f"- **حسب {c}**" for c in cites])
                 if recs:
