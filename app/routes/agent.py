@@ -707,11 +707,24 @@ async def analyze_legal_basis(
             attachments_meta.append({"filename": fn, "raw_text": t})
         attachments_merged = "\n\n---\n".join(attachments_texts)
 
+        # Relevance classification
+        try:
+            from app.modules.attachments.service import AttachmentRelevanceClassifier
+            _clf = AttachmentRelevanceClassifier()
+            _rel = _clf.classify(claim_text, attachments_meta)
+            relevant_files = [u.get("filename") for u in (_rel.get("used") or []) if u.get("filename")]
+            irrelevant_files = [u.get("filename") for u in (_rel.get("unused") or []) if u.get("filename")]
+        except Exception:
+            relevant_files = [a.get("filename") for a in attachments_meta if a.get("filename")]
+            irrelevant_files = []
+
         # Build context for agent
         context = [
             {"_key": "claim_text", "_value": claim_text},
             {"_key": "attachments_text", "_value": attachments_merged},
-            {"_key": "attachment_filenames", "_value": [a.get("filename") for a in attachments_meta if a.get("filename")]}
+            {"_key": "attachment_filenames", "_value": relevant_files},
+            {"_key": "irrelevant_attachments", "_value": irrelevant_files},
+            {"_key": "mandatory_highlights", "_value": ["افادة المدعي عليها الجهة المختصة 2.pdf"] if "افادة المدعي عليها الجهة المختصة 2.pdf" in relevant_files else []},
         ]
 
         # Run LegalBasisAgent WITHOUT Azure Search
@@ -747,80 +760,28 @@ async def analyze_legal_basis(
         except Exception:
             content = normalize_md(content)
 
-        # Parse attachments_status block to decide next step
-        has_all = None
-        missing = []
+        # The prompt no longer emits technical blocks; ensure content is clean user-facing prose
         try:
-            m = re.search(r"\[attachments_status\](.*?)\[/attachments_status\]", content, flags=re.DOTALL|re.IGNORECASE)
-            if m:
-                block = m.group(1)
-                has_line = re.search(r"HAS_ALL:\s*(yes|no)", block, flags=re.IGNORECASE)
-                if has_line:
-                    has_all = has_line.group(1).lower() == "yes"
-                miss_line = re.search(r"MISSING:\s*(.*)", block)
-                if miss_line:
-                    miss_val = miss_line.group(1).strip()
-                    if miss_val and miss_val.lower() != "<names>" and miss_val != "":
-                        missing = [x.strip() for x in miss_val.split(',') if x.strip()] 
-                content = re.sub(r"\[attachments_status\].*?\[/attachments_status\]", "", content, flags=re.DOTALL|re.IGNORECASE).strip()
+            import re as _re
+            content = _re.sub(r"```[a-zA-Z]*\s*([\s\S]*?)```", r"\1", content)
+            content = _re.sub(r"\{\s*\"inline_citations\"[\s\S]*?\}\s*$", "", content, flags=_re.MULTILINE)
         except Exception:
-            has_all = None
+            pass
 
-        # Inject inline citations where lines likely rely on specific attachments
-        inline_citations = []
+        # Heuristic citations list (metadata only), restricted to relevant files; add lightweight visible refs section
+        citations: List[str] = []
+        inline_citations: List[dict] = []
         try:
-            if content and attachments_meta:
-                import re as _re
-                domain_keywords = [
-                    "قرار", "المخالفة", "مخالفة", "محضر", "السجل", "سجل", "عقد", "ترخيص", "تصريح",
-                    "فاتورة", "تقرير", "صورة", "صور", "مراسلات", "خطاب", "إفادة", "بيان"
-                ]
-                lines = content.split("\n")
-                used_line_idxs = set()
-                for att in attachments_meta:
-                    fname = (att.get("filename") or "").strip()
-                    if not fname:
-                        continue
-                    base = fname.rsplit('.', 1)[0]
-                    tokens = [tok for tok in _re.split(r"[\s_\-]+", base) if len(tok) >= 3]
-                    raw_text = att.get("raw_text") or ""
-                    att_kws = [kw for kw in domain_keywords if kw in raw_text]
-                    search_terms = tokens + att_kws
-                    cites_for_this = 0
-                    if not search_terms:
-                        continue
-                    for idx, line in enumerate(lines):
-                        if cites_for_this >= 2:
-                            break
-                        if idx in used_line_idxs:
-                            continue
-                        striped = line.strip()
-                        if len(striped) < 6 or "حسب" in striped:
-                            continue
-                        if any(term in striped for term in search_terms):
-                            lines[idx] = line.rstrip() + f" — **حسب {fname}**"
-                            inline_citations.append({"line": idx, "attachment": fname})
-                            used_line_idxs.add(idx)
-                            cites_for_this += 1
-                content = "\n".join(lines)
-        except Exception:
-            inline_citations = []
-
-        # Build attachment citations (حسب <filename>) heuristically from content
-        try:
-            citations = []
             if content and attachments_meta:
                 import re as _re
                 for a in attachments_meta:
                     fname = (a.get("filename") or "").strip()
-                    if not fname:
+                    if not fname or (relevant_files and fname not in relevant_files):
                         continue
                     base = fname.rsplit('.', 1)[0]
                     tokens = [tok for tok in _re.split(r"[\s_\-]+", base) if len(tok) >= 3]
-                    # Simple keyword boost
                     if any(kw in content for kw in tokens):
                         citations.append(fname)
-                # De-duplicate while preserving order
                 seen = set()
                 citations = [x for x in citations if not (x in seen or seen.add(x))][:8]
                 if citations:
@@ -828,47 +789,45 @@ async def analyze_legal_basis(
         except Exception:
             citations = []
 
-        # Derive recommended attachments that strengthen defense (always produce some)
+        # Recommended attachments section: keep concise and user-facing based on claim text only
+        recommended: List[str] = []
         try:
-            recommended = []
-            # Prefer LLM-parsed 'missing' list from attachments_status block
-            if missing:
-                recommended = missing[:]
-            # Heuristics from claim text if empty
-            if not recommended:
-                text = (claim_text or "")
-                if any(x in text for x in ["قرار", "التظلم", "قرار إداري"]):
-                    recommended.append("أصل القرار الإداري")
-                if "مخالفة" in text:
-                    recommended.append("محضر الضبط وصور المخالفة")
-                if any(x in text for x in ["سجل", "تجاري"]):
-                    recommended.append("صورة السجل التجاري")
-                if any(x in text for x in ["ترخيص", "تصريح"]):
-                    recommended.append("صورة الرخصة/التصريح")
-                if any(x in text for x in ["عقد", "اتفاق"]):
-                    recommended.append("نسخة العقد وملحقاته")
-                if not recommended:
-                    recommended = ["قرار الجهة", "محضر ضبط", "مراسلات رسمية"]
-            # Optionally add a short section to the content
+            text = (claim_text or "")
+            if any(x in text for x in ["قرار", "التظلم", "قرار إداري"]):
+                recommended.append("أصل القرار الإداري")
+            if "مخالفة" in text:
+                recommended.append("محضر الضبط وصور المخالفة")
+            if any(x in text for x in ["سجل", "تجاري"]):
+                recommended.append("صورة السجل التجاري")
+            if any(x in text for x in ["ترخيص", "تصريح"]):
+                recommended.append("صورة الرخصة/التصريح")
+            if any(x in text for x in ["عقد", "اتفاق"]):
+                recommended.append("نسخة العقد وملحقاته")
             if recommended:
-                rec_lines = "\n".join([f"- {r}" for r in recommended[:6]])
-                content += f"\n\n**مرفقات مقترحة لتعزيز موقف الجهة:**\n{rec_lines}"
+                content += "\n\n**مرفقات مقترحة لتعزيز موقف الجهة:**\n" + "\n".join([f"- {r}" for r in recommended[:6]])
         except Exception:
             recommended = []
+
+        # Visible section for irrelevant attachments, if any
+        try:
+            if irrelevant_files:
+                _lines = "\n".join([f"- {fn} — غير ذي صلة بالقضية الراهنة" for fn in irrelevant_files])
+                content += f"\n\n**مرفقات غير ذات صلة بهذه القضية:**\n{_lines}"
+        except Exception:
+            pass
 
         # Store agent message in conversation history (content produced by defense-oriented prompts)
         try:
             await agent_service._store_agent_message(
                 content,
-                {"query_type": "legal_basis", "retrieval": "none", "attachments_status": ("all" if has_all else ("missing" if has_all is False else "unknown")), "missing": missing, "attachment_citations": citations, "inline_citations": inline_citations, "recommended_attachments": recommended},
+                {"query_type": "legal_basis", "retrieval": "none", "attachment_citations": citations, "inline_citations": inline_citations, "recommended_attachments": recommended, "relevance": {"used": relevant_files, "unused": irrelevant_files}},
                 request.conversation_id,
-                {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0, "reasoning": "legal basis analysis without search"}
+                {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0}
             )
         except Exception as e:
             logger.warning(f"Failed to store legal basis message: {e}")
 
-        # Return analysis content only (no attachment request message)
-        return {"response": content, "metadata": {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0, "attachment_citations": citations, "inline_citations": inline_citations, "recommended_attachments": recommended}}
+        return {"response": content, "metadata": {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0, "attachment_citations": citations, "inline_citations": inline_citations, "recommended_attachments": recommended, "relevance": {"used": relevant_files, "unused": irrelevant_files}}}
 
     except HTTPException:
         raise
@@ -1166,10 +1125,7 @@ async def legal_basis_attachments_or_proceed(
                 recs = md.get("recommended_attachments", [])
                 # Include structured attachments list for client UI
                 md["attachments"] = atts
-                if cites:
-                    content += "\n\n**المراجع (حسب المرفقات):**\n" + "\n".join([f"- **حسب {c}**" for c in cites])
-                if recs:
-                    content += "\n\n**مرفقات مقترحة لتعزيز موقف الجهة:**\n" + "\n".join([f"- {r}" for r in recs])
+                # Avoid duplicating sections already present from analyze step
                 return {"response": content, "metadata": md}
             except Exception:
                 return result

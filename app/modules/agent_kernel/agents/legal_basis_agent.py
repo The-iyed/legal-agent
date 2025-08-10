@@ -142,7 +142,7 @@ class LegalBasisAgent(BaseAgent):
                 logger.warning(f"LegalBasisAgent: search failed for '{q}': {e}")
         return results[:20]
 
-    async def _stage_analysis(self, claim_text: str, attachments_text: str, issues: str, laws: List[Dict[str, Any]], attachment_filenames: Optional[List[str]] = None) -> str:
+    async def _stage_analysis(self, claim_text: str, attachments_text: str, issues: str, laws: List[Dict[str, Any]], attachment_filenames: Optional[List[str]] = None, irrelevant_attachments: Optional[List[str]] = None, mandatory_highlights: Optional[List[str]] = None, adverse_files: Optional[List[str]] = None) -> str:
         laws_snippets = []
         for i, r in enumerate(laws[:12], 1):
             title = r.get("legislation_title") or r.get("document_name") or "(بدون عنوان)"
@@ -150,6 +150,8 @@ class LegalBasisAgent(BaseAgent):
             laws_snippets.append(f"[{i}] {title}:\n{content}")
         laws_block = "\n\n".join(laws_snippets)
         filenames_block = "\n".join(attachment_filenames or [])
+        irrelevant_block = "\n".join(irrelevant_attachments or [])
+        highlights_block = "\n".join(mandatory_highlights or [])
         prompt = (
             self.prompts["analysis"]
             .replace("{{CLAIM_TEXT}}", claim_text)
@@ -157,6 +159,9 @@ class LegalBasisAgent(BaseAgent):
             .replace("{{ISSUES}}", issues)
             .replace("{{LAWS}}", laws_block)
             .replace("{{ATTACHMENT_FILENAMES}}", filenames_block)
+            .replace("{{IRRELEVANT_ATTACHMENTS}}", irrelevant_block)
+            .replace("{{MANDATORY_HIGHLIGHTS}}", highlights_block)
+            .replace("{{ADVERSE_FILES}}", "\n".join(adverse_files or []))
         )
         return await self._process_query([{"role": "system", "content": prompt}])
 
@@ -228,7 +233,25 @@ class LegalBasisAgent(BaseAgent):
             issues = await self._stage_extract_issues(claim_text, attachments_text)
             queries = await self._stage_search_plan(issues)
             laws = await self._search_laws(queries)
-            analysis = await self._stage_analysis(claim_text, attachments_text, issues, laws, attachment_filenames)
+            # Extract optional mandatory highlights
+            highlights = []
+            try:
+                for item in (context or []):
+                    if item.get("_key") == "mandatory_highlights":
+                        val = item.get("_value")
+                        if isinstance(val, list):
+                            highlights = [str(v) for v in val if v]
+            except Exception:
+                highlights = []
+            # Heuristic adversarial files: names likely from plaintiff or that could be adverse
+            adverse = []
+            try:
+                for name in attachment_filenames:
+                    if any(k in name for k in ["المدعي", "مذكرة", "اعتراض", "دعوى", "مطالبة"]):
+                        adverse.append(name)
+            except Exception:
+                adverse = []
+            analysis = await self._stage_analysis(claim_text, attachments_text, issues, laws, attachment_filenames, None, highlights, adverse)
             defense = await self._stage_defense(analysis, laws)
             # Sanitize to avoid duplicated markdown blocks or fenced code
             analysis = self._sanitize_output(analysis)
