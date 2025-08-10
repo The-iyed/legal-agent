@@ -1221,13 +1221,11 @@ async def finalize_legal_basis(
 
         content = result.get("response", {}).get("content", "")
 
-        # Keep status at RESPONSE_DRAFTING for continued discussion
         try:
             await conversation_service.update_conversation_status(conversation_id, ConversationStatus.RESPONSE_DRAFTING)
         except Exception:
             pass
 
-        # Store final message
         await agent_service._store_agent_message(
             content,
             {"query_type": "legal_basis_final", "search": "azure_ai_search", "attachments_count_considered": len(attachments_texts)},

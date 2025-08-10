@@ -94,22 +94,26 @@ class AgentService:
             
             # Initialize Azure OpenAI client with correct deployment
             if self.settings.AZURE_OPENAI_ENDPOINT and self.settings.AZURE_OPENAI_API_KEY:
-                deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o")
-                self.openai_processor = AzureOpenAI(
-                    api_key=self.settings.AZURE_OPENAI_API_KEY,
-                    api_version="2024-11-20",
-                    azure_endpoint=self.settings.AZURE_OPENAI_ENDPOINT
-                )
-                self.azure_deployment_name = deployment_name
-                logger.info(f"Azure OpenAI client initialized with deployment: {deployment_name}")
-                
+                deployment_name = (self.settings.AZURE_OPENAI_DEPLOYMENT_NAME or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "")).strip()
+                api_version = (self.settings.AZURE_OPENAI_API_VERSION or os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")).strip()
+                if not deployment_name:
+                    logger.warning("AZURE_OPENAI_DEPLOYMENT_NAME is not set; LLM features will be disabled until configured.")
+                else:
+                    self.openai_processor = AzureOpenAI(
+                        api_key=self.settings.AZURE_OPENAI_API_KEY,
+                        api_version=api_version,
+                        azure_endpoint=self.settings.AZURE_OPENAI_ENDPOINT
+                    )
+                    self.azure_deployment_name = deployment_name
+                    logger.info(f"Azure OpenAI client initialized with deployment: {deployment_name} (api_version={api_version})")
+            
         except Exception as e:
             logger.warning(f"Failed to initialize Azure clients: {str(e)}")
 
     def _load_validation_template(self) -> dict:
         """Load validation template for document validation."""
         try:
-            # Return a basic validation template
+
             return {
                 "required_fields": [
                     "رقم الدعوى",
@@ -242,15 +246,10 @@ class AgentService:
                 if redis_payload:
                     cached_response = redis_payload.get("response")
                     cached_data = redis_payload.get("extracted_data")
-            # Fallback to in-memory cache
-            if cached_response is None:
-                cached = self._get_cached_result(cache_key)
-                if cached:
-                    cached_response, cached_data = cached
+            # Bypass in-memory cache (use Redis only)
             # Handle cache hit
             if cached_response is not None and cached_data is not None:
-                # Persist Redis-only payload into in-memory cache too
-                self._cache_result(cache_key, cached_response, cached_data)
+                # Use Redis payload only (no in-memory caching)
                 # Still upload the file to blob for this conversation
                 try:
                     file_url = await self.claim_extractor.storage_manager.upload_file(
@@ -336,7 +335,6 @@ class AgentService:
                     self._redis_cache.set_json(cache_key, {"response": response_message, "extracted_data": extracted_data}, ttl_seconds=86400)
                 except Exception as e:
                     logger.warning(f"Redis set failed: {e}")
-            self._cache_result(cache_key, response_message, extracted_data)
             
             if extraction_result.status == ProcessingStatus.VALIDATED:
                 await self._update_conversation_status(conversation_id, ConversationStatus.CLAIM_DISCUSSION)
@@ -345,10 +343,27 @@ class AgentService:
             else:
                 await self._update_conversation_status(conversation_id, ConversationStatus.CLAIM_REJECTED)
             
-            # Store agent response
+            # Store agent response with structured key-value metadata map
+            # Attempt to rebuild the 7-line map from the generated minimal response when available
+            kv_map = {}
+            try:
+                for line in (response_message or '').split('\n'):
+                    if ':' in line:
+                        k, v = line.split(':', 1)
+                        kv_map[k.strip().lstrip('-').strip()] = v.strip().strip('*').strip()
+            except Exception:
+                kv_map = {}
+            
+            base_metadata = {
+                "query_type": "file",
+                "file_processed": True,
+                "is_valid": (extraction_result.extracted_claim.is_valid if extraction_result.extracted_claim else False),
+            }
+            if kv_map:
+                base_metadata["structured_fields"] = kv_map
             await self._store_agent_message(
                 response_message, 
-                {"query_type": "file", "file_processed": True, "is_valid": (extraction_result.extracted_claim.is_valid if extraction_result.extracted_claim else False)}, 
+                base_metadata, 
                 conversation_id, 
                 {"agent_type": "claim_extractor", "confidence": extraction_result.document_intelligence_confidence or 0.0}
             )
@@ -364,7 +379,8 @@ class AgentService:
                     "validation_errors": extraction_result.error_message or [],
                     "total_pages": extraction_result.extracted_claim.total_pages if extraction_result.extracted_claim else 1,
                     "processing_time": extraction_result.processing_time,
-                    "extraction_status": extraction_result.status.value
+                    "extraction_status": extraction_result.status.value,
+                    **({"structured_fields": kv_map} if kv_map else {})
                 }
             )
             
@@ -1073,9 +1089,8 @@ Return the response in Arabic with professional formatting.
         try:
             # Check cache first
             cache_key = self._generate_cache_key(file_content, filename)
-            cached_result = self._get_cached_result(cache_key)
-            if cached_result:
-                return cached_result
+            # Bypass in-memory cache (Redis only)
+            cached_result = None
             
             # First, use Azure Document Intelligence to extract clean text with better layout analysis
             from app.modules.document_processor.service import DocumentProcessorService
@@ -1087,7 +1102,6 @@ Return the response in Arabic with professional formatting.
             if not self.openai_processor:
                 logger.warning("Azure OpenAI client not configured, using fallback response with extracted text")
                 fallback_response = self._generate_fallback_response(extracted_text)
-                self._cache_result(cache_key, fallback_response, {})
                 return fallback_response, {}
             
             # Enhanced extraction prompt with better structure for legal documents
@@ -1194,40 +1208,71 @@ Create a detailed response with these sections:
 
 ## 📋 **تفاصيل القضية**
 
-**رقم الدعوى:** {extracted_data.get('case_number', 'غير مذكور')}
-**موضوع الدعوى:** {extracted_data.get('case_subject', 'غير مذكور')}
-**نوع الدعوى:** {extracted_data.get('case_type', 'غير مذكور')}
-**اسم المدعي:** {extracted_data.get('plaintiff_name', 'غير مذكور')}
-**اسم المدعى عليه:** {extracted_data.get('defendant_name', 'غير مذكور')}
-**تاريخ تقديم الدعوى:** {extracted_data.get('filing_date', 'غير مذكور')}
-**المحكمة:** {extracted_data.get('court', 'غير مذكور')}
+**معلومات المحكمة:**
+- **المحكمة:** {extracted_data.get('court', 'غير مذكور')}
+- **رقم الطلب:** {extracted_data.get('court_info', {}).get('request_number', 'غير مذكور')}
+- **رقم قيد الدعوى:** {extracted_data.get('court_info', {}).get('case_registration_number', 'غير مذكور')}
+- **تاريخ التقديم:** {extracted_data.get('court_info', {}).get('submission_date', 'غير مذكور')}
+- **نوع الطلب:** {'طلب جديد' if extracted_data.get('court_info', {}).get('is_new_request', False) else 'غير محدد'}
 
-## 📝 **ملخص القضية**
+**بيانات المدعي:**
+- **الاسم:** {extracted_data.get('plaintiff_info', {}).get('name', 'غير مذكور')}
+- **المهنة:** {extracted_data.get('plaintiff_info', {}).get('profession', 'غير مذكور')}
+- **الجنسية:** {extracted_data.get('plaintiff_info', {}).get('nationality', 'غير مذكور')}
+- **رقم الهوية:** {extracted_data.get('plaintiff_info', {}).get('id_number', 'غير مذكور')}
 
-{extracted_data.get('case_summary', 'تم تحليل المستند بنجاح. المستند يحتوي على معلومات القضية الأساسية.')}
+**عنوان المدعي:**
+- **المدينة:** {extracted_data.get('plaintiff_address', {}).get('city', 'غير مذكور')}
+- **الشارع:** {extracted_data.get('plaintiff_address', {}).get('street', 'غير مذكور')}
+- **رقم المبني:** {extracted_data.get('plaintiff_address', {}).get('building_number', 'غير مذكور')}
+- **البريد الإلكتروني:** {extracted_data.get('plaintiff_address', {}).get('email', 'غير مذكور')}
+- **الهاتف:** {extracted_data.get('plaintiff_address', {}).get('mobile', 'غير مذكور')}
+
+**بيانات المدعى عليه:**
+- **نوع الجهة:** {extracted_data.get('defendant_info', {}).get('entity_type', 'غير مذكور')}
+- **الاسم:** {extracted_data.get('defendant_info', {}).get('name', 'غير مذكور')}
+- رقم السجل: {extracted_data.get('defendant_info', {}).get('id_number', 'غير مذكور')}
+
+## 📝 **معلومات اضافية**
+
+**تفاصيل القرار:**
+- **رقم القرار:** {extracted_data.get('additional_info', {}).get('decision_number', 'غير مذكور')}
+- **تاريخ القرار:** {extracted_data.get('additional_info', {}).get('decision_date', 'غير مذكور')}
+- **رقم التظلم:** {extracted_data.get('additional_info', {}).get('grievance_number', 'غير مذكور')}
+- **تاريخ التظلم:** {extracted_data.get('additional_info', {}).get('grievance_date', 'غير مذكور')}
+
+**تفاصيل القضية:**
+- **رقم المخالفة:** {extracted_data.get('case_details', {}).get('violation_number', 'غير مذكور')}
+- **السجل التجاري:** {extracted_data.get('case_details', {}).get('commercial_register', 'غير مذكور')}
+- **الطلب المطلوب:** {extracted_data.get('case_details', {}).get('requested_action', 'غير مذكور')}
+
+**بيانات التواصل:**
+- **الجوال الاساسي:** {extracted_data.get('contact_info', {}).get('primary_mobile', 'غير مذكور')}
+- **الجوال الاضافي:** {extracted_data.get('contact_info', {}).get('additional_mobile', 'غير مذكور')}
+- **البريد الالكتروني:** {extracted_data.get('contact_info', {}).get('email', 'غير مذكور')}
+
+## 📄 **ملخص القضية**
+
+{extracted_data.get('case_details', {}).get('case_description', 'تم تحليل صحيفة الدعوى بنجاح. المستند يحتوي على معلومات القضية الأساسية.')}
 
 ## 🔄 **الخطوات التالية**
 
 **هل لديك مرفقات إضافية تريد رفعها؟**
 
-💡 *المرفقات الداعمة ستساعد في تعزيز موقفك القانوني.*"""
+💡 *المرفقات الداعمة مثل الهوية والسجل التجاري وصورة المخالفة ستساعد في تعزيز موقفك القانوني.*"""
             
             response = self.openai_processor.chat.completions.create(
                 model=self.azure_deployment_name,
                 messages=[
-                    {"role": "system", "content": "You are an expert legal assistant. Create comprehensive, professional responses in Arabic based on actual legal document analysis. Use the extracted information provided and format the response professionally."},
+                    {"role": "system", "content": "You are an expert Saudi Arabian legal assistant. Create comprehensive, professional responses in Arabic for صحيفة الدعوى documents. Use the extracted information provided and format the response professionally with proper Arabic formatting."},
                     {"role": "user", "content": response_prompt}
                 ],
                 temperature=0.1,
-                max_tokens=3000
+                max_tokens=5000
             )
             
             llm_response = response.choices[0].message.content.strip()
-            logger.info(f"Generated Azure OpenAI response from Document Intelligence text for conversation {conversation_id}")
-            
-            # Cache the result
-            self._cache_result(cache_key, llm_response, extracted_data)
-            
+            logger.info(f"Generated Saudi legal document response for conversation {conversation_id}")
             return llm_response, extracted_data
             
         except Exception as e:
@@ -1239,11 +1284,9 @@ Create a detailed response with these sections:
                 document_processor = DocumentProcessorService()
                 extracted_text = await document_processor._extract_raw_text_only(file_content, filename)
                 fallback_response = self._generate_fallback_response(extracted_text)
-                self._cache_result(cache_key, fallback_response, {})
                 return fallback_response, {}
             except:
                 fallback_response = self._generate_fallback_response()
-                self._cache_result(cache_key, fallback_response, {})
                 return fallback_response, {}
     
     async def _extract_text_from_pdf(self, file_content: bytes, filename: str) -> str:
@@ -1553,6 +1596,36 @@ Create a detailed response with these sections:
             case_subject = self._extract_field_value(claim_data, "case_subject", "موضوع الدعوى")
             case_type = self._extract_field_value(claim_data, "case_type", "نوع الدعوى")
             
+            # Build aggregated texts for LLM summary
+            claim_text = (claim_data or {}).get("raw_text", "") or (claim_data.get("claim_overview") if isinstance(claim_data, dict) else "") or ""
+            atts_texts = []
+            for a in attachment_results:
+                t = ((a.get("extracted_content", {}) or {}).get("raw_text", "") or "").strip()
+                if t:
+                    atts_texts.append(t)
+            merged_atts = "\n\n---\n".join(atts_texts)
+
+            # Try to generate a concise "أولاً: تلخيص وقائع القضية" using LLM
+            llm_overview = ""
+            try:
+                if self.openai_processor and (claim_text or merged_atts):
+                    prompt = (
+                        "أنت محامٍ مختص. قدّم فقرة واحدة بعنوان: 'أولاً: تلخيص وقائع القضية' \n"
+                        "تلخّص بدقة الوقائع والتواريخ والأطراف وأرقام المستندات والطلبات كما وردت حرفياً في صحيفة الدعوى والمرفقات (إن وُجدت)، \n"
+                        "بأسلوب عربي مهني ومركز من 5–8 أسطر كحد أقصى، دون أي تقييم قانوني.\n\n"
+                        f"[صحيفة الدعوى]\n{claim_text}\n\n[نصوص المرفقات]\n{merged_atts}"
+                    )
+                    comp = self.openai_processor.chat.completions.create(
+                        model=self.azure_deployment_name,
+                        messages=[{"role": "system", "content": "ملخّص قانوني وقائع فقط"}, {"role": "user", "content": prompt}],
+                        temperature=0.0,
+                        max_tokens=300
+                    )
+                    llm_overview = (comp.choices[0].message.content or "").strip()
+            except Exception as _e:
+                logger.warning(f"LLM attachments overview failed: {_e}")
+                llm_overview = ""
+            
             # Generate attachment summaries based on raw text only
             attachment_summaries = []
             for i, attachment in enumerate(attachment_results, 1):
@@ -1577,11 +1650,16 @@ Create a detailed response with these sections:
                 pass
             
             # Build comprehensive response
-            response = (
-                "✅ تم استلام ورفع مرفقاتك بنجاح.\n\n"
-                f"- تم حفظ النص المستخرج لكل مرفق ({len(attachment_results)}) وربطه بهذه المحادثة.\n"
-                "يمكنك الآن مناقشة المرفقات معي مباشرة أو رفع المزيد عند الحاجة."
-            )
+            parts = [
+                "✅ تم استلام ورفع مرفقاتك بنجاح.",
+            ]
+            if llm_overview:
+                parts.append("")
+                parts.append(llm_overview)
+            parts.append("")
+            parts.append(f"- تم حفظ النص المستخرج لكل مرفق ({len(attachment_results)}) وربطه بهذه المحادثة.")
+            parts.append("يمكنك الآن مناقشة المرفقات معي مباشرة أو رفع المزيد عند الحاجة.")
+            response = "\n".join(parts)
             
             return response
             
@@ -2193,165 +2271,165 @@ Create a detailed response with these sections:
             return {}
 
     async def _generate_professional_legal_response(self, extraction_result: ExtractionResult, conversation_id: str) -> str:
-        """Generate a professional legal response like a lawyer would."""
+        """Generate a minimal structured response via LLM over raw text; fallback to heuristics."""
         try:
             if not extraction_result.extracted_claim:
                 return "عذراً، لم يتم استخراج معلومات كافية من المستند. يرجى التأكد من أن الملف يحتوي على صحيفة دعوى صحيحة."
             
             claim = extraction_result.extracted_claim
             
-            response_parts = []
-            
-            response_parts.append("✅ تمت قراءة صحيفة الدعوى بنجاح.")
-            response_parts.append("فيما يلي عرض مهني منظم لأهم ما ورد، يليه إبراز نقاط حساسة وخطوات عملية.")
-            response_parts.append("")
-            
-            response_parts.append("أولاً: معلومات أساسية عن الدعوى")
-            response_parts.append(f"• نوع الدعوى: {claim.case_type or 'غير محدد'}")
-            response_parts.append(f"• رقم القضية: {claim.case_number or 'غير محدد'}")
-            response_parts.append(f"• عدد الصفحات: {extraction_result.extracted_claim.total_pages or 1}")
-            response_parts.append("")
-            
-            response_parts.append("ثانياً: الأطراف المعنية")
-            response_parts.append(f"• المدعي: {claim.plaintiff_name or 'غير محدد'}")
-            response_parts.append(f"• المدعى عليه: {claim.defendant_name or 'غير محدد'}")
-            response_parts.append("")
-             
-            response_parts.append("ثالثاً: عرض منظم لوقائع الدعوى ومطالب المدعي")
-            if claim.case_subject:
-                response_parts.append(f"• موضوع الدعوى: {claim.case_subject}")
-            if claim.claim_amount:
-                response_parts.append(f"• مبلغ المطالبة: {claim.claim_amount}")
-            if claim.court_name:
-                response_parts.append(f"• المحكمة المختصة: {claim.court_name}")
-            try:
-                keywords = ["إلغاء", "تعويض", "إلزام", "إيقاف", "شطب", "تصحيح", "إعادة"]
-                candidates: List[str] = []
-                if getattr(claim, "case_requests", None):
-                    candidates.extend([l.strip() for l in str(claim.case_requests).split("\n") if l.strip()])
-                if getattr(claim, "claim_overview", None):
-                    candidates.extend([l.strip() for l in str(claim.claim_overview).split("\n") if l.strip()])
-                if getattr(claim, "case_subject", None):
-                    candidates.append(str(claim.case_subject))
-                picked: List[str] = []
-                for line in candidates:
-                    if any(k in line for k in keywords):
-                        picked.append(line)
-                    if len(picked) >= 2:
-                        break
-                request_summary = None
-                if picked:
-                    request_summary = "؛ ".join(picked[:2])
-                elif getattr(claim, "case_requests", None):
-                    txt = str(claim.case_requests).strip()
-                    request_summary = (txt[:160] + "…") if len(txt) > 160 else txt
-                elif getattr(claim, "claim_overview", None):
-                    txt = str(claim.claim_overview).strip()
-                    request_summary = (txt[:160] + "…") if len(txt) > 160 else txt
-                if request_summary and len([c for c in request_summary if c.isalnum()]) >= 3:
-                    response_parts.append(f"• وصف الطلب: {request_summary}")
-            except Exception:
-                pass
-            if getattr(claim, 'claim_overview', None):
-                text = claim.claim_overview.strip()
-                response_parts.append("• مطالب المدعي كما تظهر من المستند: ")
-                excluded_phrases = ["التقييم القانوني", "تحليل قانوني", "تقييم قانوني"]
-                for line in [l.strip('-• \t') for l in text.split('\n') if l.strip()][:10]:
-                    if any(phrase in line for phrase in excluded_phrases):
-                        continue
-                    if len([c for c in line if c.isalnum()]) < 2:
-                        continue
-                    response_parts.append(f"  - {line}")
-            response_parts.append("• الطلبات المقدمة كما وردت في صحيفة الدعوى:")
-            requests_lines = []
-            if getattr(claim, 'case_requests', None):
-                req_text = claim.case_requests.strip()
-                for line in [l.strip('-• \t') for l in req_text.split('\n') if l.strip()]:
-                    if len([c for c in line if c.isalnum()]) < 2:
-                        continue
-                    requests_lines.append(f"  - {line}")
-                if not requests_lines:
-                    import re as _re
-                    parts = [p.strip() for p in _re.split(r'[،؛\.]', req_text) if p.strip()]
-                    for p in parts[:6]:
-                        requests_lines.append(f"  - {p}")
-            # من أقسام النص المستخرج (الطلبات المقدمة في القضية)
-            if not requests_lines and extraction_result.raw_text:
-                try:
-                    from app.modules.claim_extractor.text_processor import TextProcessor as _TP
-                    sections = _TP().extract_saudi_legal_sections(extraction_result.raw_text)
-                    reqs_text = (sections or {}).get("requests_in_case", "").strip()
-                    if reqs_text:
-                        for line in [l.strip('-• ') for l in reqs_text.split('\n') if l.strip()]:
-                            if len(requests_lines) >= 6:
-                                break
-                            if "الطلبات" in line:
-                                continue
-                            requests_lines.append(f"  - {line}")
-                except Exception:
-                    pass
-            # من نظرة عامة على الدعوى (كخيار أخير)
-            if not requests_lines and getattr(claim, 'claim_overview', None):
-                ov = claim.claim_overview.strip()
-                candidates = [l.strip('-• \t') for l in ov.split('\n') if l.strip()]
-                for line in candidates:
-                    if any(kw in line for kw in ["الطلب", "طلبات", "إلغاء", "تعويض", "إلزام", "إيقاف", "إلغاء قرار"]):
-                        requests_lines.append(f"  - {line}")
-                        if len(requests_lines) >= 6:
-                            break
-            if requests_lines:
-                response_parts.extend(requests_lines)
-            else:
-                response_parts.append("  - غير مذكور صراحة في النص المستخرج.")
-            response_parts.append("")
-             
-            response_parts.append("**رابعاً: الإقرارات**")
-            response_parts.append("• الإقرارات الموجودة في صحيفة الدعوى:")
-            declarations_lines = []
-            try:
-                from app.modules.claim_extractor.text_processor import TextProcessor
-                if extraction_result.raw_text:
-                    sections = TextProcessor().extract_saudi_legal_sections(extraction_result.raw_text)
-                    decl_text = (sections or {}).get("declarations", "").strip()
-                    if decl_text:
-                        for line in [l.strip() for l in decl_text.split("\n") if l.strip()]:
-                            if len(declarations_lines) >= 6:
-                                break
-                            # prioritize lines that look like explicit declarations/acknowledgements
-                            if (any(kw in line for kw in ["أقر", "أتعهد", "أوافق"]) or line.startswith("-") or line.startswith("•")) and ("الاقرارات" not in line):
-                                cleaned = line.lstrip("•- ").strip()
-                                if cleaned:
-                                    declarations_lines.append(f"- {cleaned}")
-            except Exception:
-                pass
-            if declarations_lines:
-                response_parts.extend(declarations_lines)
-            else:
-                response_parts.append("- لم يتم العثور على إقرارات واضحة في النص المستخرج.")
-            response_parts.append("")
-            
-            # Highlights
-            response_parts.append("خامساً: نقاط بارزة تستحق الانتباه")
-            highlights = []
-            if claim.case_subject:
-                highlights.append("يمكن الدفع بعدم توافر الأساس النظامي للطلب كما صيغ في صحيفة الدعوى.")
-            if claim.case_number:
-                highlights.append("توثيق رقم القضية يمكّن من طلب السجل الإجرائي والقرارات ذات الصلة لدحض مزاعم المدعي.")
-            if claim.court_name:
-                highlights.append("اختصاص المحكمة قد يكون محلاً للدفع إن تبيّن تعلق النزاع بقرارات تنظيمية عامة.")
-            if getattr(claim, 'violation_number', None) or getattr(claim, 'decision_number', None):
-                highlights.append("يمكن طلب أصل القرار/المخالفة ومحاضر الضبط للتحقق من سلامة الإجراءات والاختصاص.")
-            if not highlights:
-                highlights.append("لا توجد نقاط بارزة إضافية حالياً؛ سيُبنى الدفاع وفق ما يُستكمل من مرفقات.")
-            response_parts.extend([f"- {h}" for h in highlights])
-            response_parts.append("")
 
-            # Closing note (defense-oriented)
-            response_parts.append("سادساً: التوجيه الإجرائي للدفاع")
-            response_parts.append("- سنبني دفوع الجهة المدعى عليها على ما ورد في الصحيفة وما يُستكمل من مستندات، مع إبراز أي ثغرات شكلية أو موضوعية تُسهم في رفض طلبات المدعي.")
-             
-            return "\n".join(response_parts)
-            
+            rt = (extraction_result.raw_text or "").strip()
+            if self.openai_processor and rt:
+                try:
+                    raw_snippet = rt  # pass full raw text to maximize extraction fidelity
+                    system_msg = (
+                        "أنت مساعد قانوني دقيق. استخرج القيم المطلوبة من نص صحيفة الدعوى فقط دون أي افتراضات أو إعادة صياغة. "
+                        "أعد مخرجاً من 7 أسطر بالضبط، كل سطر بصيغة key: value والقيمة بين ** بالخط الغامق.\n"
+                        "المفاتيح بهذا الترتيب: \n"
+                        "- المدعي:\n- محل إقامة المدعي:\n- المدعى عليه:\n- موضوع الدعوى:\n- طلبات المدعي:\n- ملخص موجز:\n- النقطة الرئيسة:\n"
+                        "قواعد صارمة لا تخلّ بها: \n"
+                        "1) القيم يجب أن تكون عبارات ذات معنى مأخوذة حرفياً من النص (substring)، وليست أوصافاً عامة.\n"
+                        "2) ممنوع إرجاع كلمات عامة أو تسميات مثل: 'سعودي'، 'المدعي'، 'المدعى عليه'، 'وقائعها كاملة'، إلخ.\n"
+                        "3) 'المدعي' و'المدعى عليه': أرجِع الاسم الصريح لشخص/جهة كما يظهر بعد صيغ مثل 'المدعي:' أو داخل السطر ذاته (مثال صحيح: **أمانة منطقة الرياض**).\n"
+                        "4) 'محل إقامة المدعي': التقط مدينة/حي/عنواناً إذا وردت بصيغ مثل 'يقيم في/العنوان/محل الإقامة/مدينة/حي'.\n"
+                        "5) 'موضوع الدعوى': عبارة قصيرة تصف جوهر الطلب (مثال: **إلغاء قرار إداري بفرض غرامة**)، وتجنّب أي تعليقات إنشائية.\n"
+                        "6) 'طلبات المدعي': استخرج حتى عنصرين حرفياً من الطلبات كما بالصحيفة؛ احذف العناوين والرموز فقط.\n"
+                        "7) 'ملخص موجز': جملتان كحد أقصى تلخّص الوقائع (تواريخ/أرقام/أطراف) دون أي تقييم قانوني.\n"
+                        "8) 'النقطة الرئيسة': عبارة قصيرة تصف موضع النزاع الرئيس (مثال: **إلغاء مخالفة dumping**).\n"
+                        "9) لا تضف أي أسطر أو تعليقات أخرى. وإن تعذر العثور على قيمة حقيقية بعد البحث، اكتب: **غير محدد**.\n"
+                        "أمثلة التنسيق:\n"
+                        "المدعي: **محمد بن سعد العتيبي**\nمحل إقامة المدعي: **الرياض — حي اليرموك**\nالمدعى عليه: **أمانة منطقة الرياض**\nموضوع الدعوى: **إلغاء قرار إداري بفرض غرامة**\nطلبات المدعي: **إلغاء قرار الغرامة؛ رد المبلغ**\nملخص موجز: **رُصدت المخالفة بتاريخ … وتظلم المدعي ورُفض التظلم**\nالنقطة الرئيسة: **إلغاء قرار الغرامة**"
+                    )
+                    user_msg = (
+                        f"[نص صحيفة الدعوى]\n{raw_snippet}\n\n"
+                        "أعد القيم المطلوبة الآن وفق الصيغة المحددة أعلاه فقط."
+                    )
+                    resp = self.openai_processor.chat.completions.create(
+                        model=self.azure_deployment_name,
+                        messages=[
+                            {"role": "system", "content": system_msg},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        temperature=0.0,
+                        max_tokens=600,
+                    )
+                    content = (resp.choices[0].message.content or "").strip()
+                    # strip code fences if any
+                    if content.startswith('```'):
+                        content = content.split('```', 2)[-1].strip()
+                    # Validate format: at least 7 lines with ':' and bolds, then sanitize
+                    lines = [l.strip() for l in content.split('\n') if l.strip()]
+                    if len(lines) >= 7 and all(':' in l for l in lines[:7]):
+                        expected_keys = [
+                            "المدعي",
+                            "محل إقامة المدعي",
+                            "المدعى عليه",
+                            "موضوع الدعوى",
+                            "طلبات المدعي",
+                            "ملخص موجز",
+                            "النقطة الرئيسة",
+                        ]
+                        # Build sources for grounding
+                        allowed_text_blob = " \n".join([
+                            rt,
+                            str(getattr(claim, 'case_requests', '') or ''),
+                            str(getattr(claim, 'claim_overview', '') or ''),
+                            str(getattr(claim, 'case_subject', '') or ''),
+                        ])
+                        # Try parse requests section from raw
+                        requests_catalog = []
+                        try:
+                            from app.modules.claim_extractor.text_processor import TextProcessor as _TP
+                            secs = _TP().extract_saudi_legal_sections(rt)
+                            reqs_text = (secs or {}).get('requests_in_case', '').strip()
+                            if reqs_text:
+                                requests_catalog = [l.strip('-• ').strip() for l in reqs_text.split('\n') if l.strip()]
+                        except Exception:
+                            requests_catalog = []
+                        banned_values = {"سعودي", "المدعي", "المدعى عليه", "وقائعها كاملة", "تم قيد دعوى", "غير محدد"}
+                        cleaned_out = []
+                        for idx, key in enumerate(expected_keys):
+                            raw_line = lines[idx]
+                            try:
+                                _, v = raw_line.split(':', 1)
+                            except ValueError:
+                                v = "غير محدد"
+                            v = v.strip()
+                            v_inner = v.strip('*').strip() if (v.startswith('**') and v.endswith('**')) else v
+                            v_inner = v_inner.strip()
+
+                            def present_in_source(val: str) -> bool:
+                                return bool(val) and (val in allowed_text_blob)
+
+                            # Key-specific acceptance rules
+                            if key in ("المدعي", "المدعى عليه"):
+                                if not present_in_source(v_inner) or v_inner in banned_values or len(v_inner) < 3:
+                                    # fallback to extracted fields for names
+                                    if key == "المدعي":
+                                        v_inner = (getattr(claim, 'plaintiff_name', '') or 'غير محدد').strip()
+                                    else:
+                                        v_inner = (getattr(claim, 'defendant_name', '') or 'غير محدد').strip()
+                                    if not v_inner:
+                                        v_inner = 'غير محدد'
+                            elif key == "محل إقامة المدعي":
+                                # accept if has city/area tokens or present in text; else try regex
+                                if v_inner in banned_values or len(v_inner) < 3:
+                                    import re as _re
+                                    m = _re.search(r"(?:عنوان|إقامة|يقيم|سكن|محل إقامته)[:：\s]*([^\n\r]+)", rt)
+                                    v_inner = (m.group(1).strip() if m else 'غير محدد')
+                            elif key == "موضوع الدعوى":
+                                # allow concise phrases even if not exact substring, but not banned/generic
+                                if v_inner in banned_values or len(v_inner) < 4:
+                                    v_inner = (getattr(claim, 'case_subject', '') or 'غير محدد').strip() or 'غير محدد'
+                            elif key == "طلبات المدعي":
+                                # Prefer verbatim requests; if missing, build from catalog or case_requests
+                                if v_inner in banned_values or len(v_inner) < 3:
+                                    if requests_catalog:
+                                        v_inner = '؛ '.join(requests_catalog[:2])
+                                    else:
+                                        req_text = (getattr(claim, 'case_requests', '') or '').strip()
+                                        if req_text:
+                                            items = [l.strip('-• \t') for l in req_text.split('\n') if l.strip()]
+                                            v_inner = '؛ '.join(items[:2]) if items else 'غير محدد'
+                            elif key in ("ملخص موجز", "النقطة الرئيسة"):
+                                # LLM-only fields; accept if not banned and has minimal length; else غير محدد
+                                if v_inner in banned_values or len(v_inner) < 8:
+                                    v_inner = 'غير محدد'
+
+                            cleaned_out.append(f"{key}: **{v_inner or 'غير محدد'}**")
+                        return "\n".join(cleaned_out)
+                except Exception as _e:
+                    logger.warning(f"LLM structured extraction failed, falling back. err={_e}")
+
+            plaintiff = (claim.plaintiff_name or "غير محدد").strip()
+            defendant = (claim.defendant_name or "غير محدد").strip()
+            residence = "غير محدد"
+            try:
+                import re as _re
+                m = _re.search(r"(?:عنوان|إقامة|يقيم|سكن|محل إقامته)[:：\s]*([^\n\r]+)", rt)
+                if m:
+                    residence = m.group(1).strip()
+            except Exception:
+                pass
+
+            subject = (getattr(claim, "case_subject", None) or "غير محدد").strip()
+            requests_summary = (getattr(claim, "case_requests", None) or "غير محدد").strip() or "غير محدد"
+            # For fallback, do not infer summary/main point; keep them for LLM only in fallback
+            concise_summary = "غير محدد"
+            main_point = "غير محدد"
+
+            lines = [
+                f"المدعي: **{plaintiff}**",
+                f"محل إقامة المدعي: **{residence}**",
+                f"المدعى عليه: **{defendant}**",
+                f"موضوع الدعوى: **{subject or 'غير محدد'}**",
+                f"طلبات المدعي: **{requests_summary or 'غير محدد'}**",
+                f"ملخص موجز: **{concise_summary or 'غير محدد'}**",
+                f"النقطة الرئيسة: **{main_point or 'غير محدد'}**",
+            ]
+            return "\n".join(lines)
+        
         except Exception as e:
             logger.error(f"Error generating professional legal response: {e}")
             return "تمت قراءة الملف، ويمكننا المتابعة بتفصيل الردود القانونية عند إرفاق الوثائق الداعمة."
@@ -2374,7 +2452,7 @@ Create a detailed response with these sections:
                     "upload_timestamp": att.get("upload_timestamp"),
                     "attachment_type": att.get("attachment_type", "supporting_document")
                 })
-            # Append or set attachments array on statement_of_claim
+
             await self.db.statement_of_claim.update_one(
                 {"conversation_id": conversation_id},
                 {"$push": {"attachments": {"$each": attachments_for_claim}}, "$set": {"updated_at": datetime.utcnow()}},
@@ -2385,8 +2463,11 @@ Create a detailed response with these sections:
             logger.error(f"Error appending attachments to claim: {e}")
             raise
 
-    def _compose_conversation_title_desc(self, claim) -> tuple[str, str]:
-  
+    def _compose_conversation_title_desc_with_raw(self, claim, raw_text: str | None) -> tuple[str, str]:
+        """Compose short title and description from claim fields; fallback to raw_text heuristics.
+        Title: case_type — case_subject (or رقم <case_number>)
+        Description: concise phrase (e.g., 'نزاع تجاري بين شركتين').
+        """
         try:
             # Title
             parts = []
@@ -2402,7 +2483,7 @@ Create a detailed response with these sections:
             title = " — ".join([p for p in parts if p]) or "دعوى جديدة"
 
             # Description base by type
-            t_norm = case_type.replace("ة", "ه")
+            t_norm = case_type.replace("ة", "ه") if case_type else ""
             if "تجار" in t_norm:
                 base = "نزاع تجاري"
             elif "ادار" in t_norm:
@@ -2437,7 +2518,6 @@ Create a detailed response with these sections:
             else:
                 parties = "بين طرفين"
 
-            # Subject hint
             subject_hint = ""
             subj = case_subject
             if subj:
@@ -2451,10 +2531,42 @@ Create a detailed response with these sections:
                     subject_hint = " بشأن عقد"
 
             description = f"{base} {parties}{subject_hint}".strip()
+            # If everything is generic and raw_text available, infer from raw
+            if (not case_type and not case_subject) and raw_text:
+                rt = raw_text
+                if any(k in rt for k in ["تجاري", "شركة", "عقد"]):
+                    base = "نزاع تجاري"
+                elif any(k in rt for k in ["ديوان المظالم", "المحكمة الإدارية", "قرار إداري", "جهة حكومية", "أمانة"]):
+                    base = "نزاع إداري"
+                elif "جنائي" in rt:
+                    base = "قضية جنائية"
+                # parties from raw
+                if "شركة" in rt and rt.count("شركة") >= 2:
+                    parties = "بين شركتين"
+                elif any(k in rt for k in ["وزارة", "أمانة", "بلدية", "هيئة"]):
+                    parties = "بين جهة حكومية وطرف آخر"
+                else:
+                    parties = "بين طرفين"
+                if any(k in rt for k in ["إلغاء القرار", "الغاء القرار", "قرار إداري"]):
+                    subject_hint = " حول إلغاء قرار إداري"
+                elif "تعويض" in rt:
+                    subject_hint = " بشأن مطالبة تعويض"
+                elif "مخالفة" in rt:
+                    subject_hint = " بشأن مخالفة بلدية"
+                elif any(k in rt for k in ["عقد", "إيجار", "بيع"]):
+                    subject_hint = " بشأن عقد"
+                description = f"{base} {parties}{subject_hint}".strip()
+                # title from raw as well
+                if title == "دعوى جديدة":
+                    if base != "نزاع":
+                        title = base
+                    if subject_hint:
+                        title = f"{base} — {subject_hint.replace(' بشأن ', '').replace(' حول ', '')}".strip()
+
             # Keep it short
             if len(description) > 64:
                 description = description[:64].rstrip()
             return title, description
         except Exception as e:
-            logger.warning(f"_compose_conversation_title_desc failed: {e}")
+            logger.warning(f"_compose_conversation_title_desc_with_raw failed: {e}")
             return "دعوى جديدة", "نزاع بين طرفين"
