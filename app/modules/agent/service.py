@@ -309,16 +309,15 @@ class AgentService:
             except Exception as _:
                 pass
             
-            # Store extracted data
+
             extracted_data = await self._convert_extraction_result_to_data(extraction_result)
             await self._store_statement_of_claim(conversation_id, extraction_result.file_url, extracted_data)
 
-            # Generate conversation title/description from extracted claim
+
             try:
                 from bson import ObjectId
                 claim = extraction_result.extracted_claim
-                # Compose human-readable title and description
-                title, description = self._compose_conversation_title_desc(claim)
+                title, description = self._compose_conversation_title_desc_with_raw(claim, extraction_result.raw_text)
                 update_doc = {"name": title, "description": description}
                 result = await self.db.conversations.update_one(
                     {"_id": ObjectId(conversation_id)},
@@ -331,7 +330,7 @@ class AgentService:
             except Exception as e:
                 logger.warning(f"Failed to update conversation title/description: {e}")
 
-            # Cache the result for future identical files (both Redis and in-memory)
+    
             if getattr(self, "_redis_cache", None):
                 try:
                     self._redis_cache.set_json(cache_key, {"response": response_message, "extracted_data": extracted_data}, ttl_seconds=86400)
@@ -339,7 +338,6 @@ class AgentService:
                     logger.warning(f"Redis set failed: {e}")
             self._cache_result(cache_key, response_message, extracted_data)
             
-            # Update conversation status based on extraction result
             if extraction_result.status == ProcessingStatus.VALIDATED:
                 await self._update_conversation_status(conversation_id, ConversationStatus.CLAIM_DISCUSSION)
             elif extraction_result.status == ProcessingStatus.COMPLETED:
@@ -2202,23 +2200,18 @@ Create a detailed response with these sections:
             
             claim = extraction_result.extracted_claim
             
-            # Build professional legal response
             response_parts = []
             
-            # Header (lawyerly, concise)
             response_parts.append("✅ تمت قراءة صحيفة الدعوى بنجاح.")
             response_parts.append("فيما يلي عرض مهني منظم لأهم ما ورد، يليه إبراز نقاط حساسة وخطوات عملية.")
-            response_parts.append("تنويه: نمثل الجهة المدعى عليها (مثل أمانة منطقة الرياض). سنعرض القراءة بمنظور دفاعي دون تبنّي مزاعم المدعي.")
             response_parts.append("")
             
-            # Basic case information
             response_parts.append("أولاً: معلومات أساسية عن الدعوى")
             response_parts.append(f"• نوع الدعوى: {claim.case_type or 'غير محدد'}")
             response_parts.append(f"• رقم القضية: {claim.case_number or 'غير محدد'}")
             response_parts.append(f"• عدد الصفحات: {extraction_result.extracted_claim.total_pages or 1}")
             response_parts.append("")
             
-            # Parties information
             response_parts.append("ثانياً: الأطراف المعنية")
             response_parts.append(f"• المدعي: {claim.plaintiff_name or 'غير محدد'}")
             response_parts.append(f"• المدعى عليه: {claim.defendant_name or 'غير محدد'}")
@@ -2231,11 +2224,37 @@ Create a detailed response with these sections:
                 response_parts.append(f"• مبلغ المطالبة: {claim.claim_amount}")
             if claim.court_name:
                 response_parts.append(f"• المحكمة المختصة: {claim.court_name}")
-            # Try to surface claimant asks from overview text if available
+            try:
+                keywords = ["إلغاء", "تعويض", "إلزام", "إيقاف", "شطب", "تصحيح", "إعادة"]
+                candidates: List[str] = []
+                if getattr(claim, "case_requests", None):
+                    candidates.extend([l.strip() for l in str(claim.case_requests).split("\n") if l.strip()])
+                if getattr(claim, "claim_overview", None):
+                    candidates.extend([l.strip() for l in str(claim.claim_overview).split("\n") if l.strip()])
+                if getattr(claim, "case_subject", None):
+                    candidates.append(str(claim.case_subject))
+                picked: List[str] = []
+                for line in candidates:
+                    if any(k in line for k in keywords):
+                        picked.append(line)
+                    if len(picked) >= 2:
+                        break
+                request_summary = None
+                if picked:
+                    request_summary = "؛ ".join(picked[:2])
+                elif getattr(claim, "case_requests", None):
+                    txt = str(claim.case_requests).strip()
+                    request_summary = (txt[:160] + "…") if len(txt) > 160 else txt
+                elif getattr(claim, "claim_overview", None):
+                    txt = str(claim.claim_overview).strip()
+                    request_summary = (txt[:160] + "…") if len(txt) > 160 else txt
+                if request_summary and len([c for c in request_summary if c.isalnum()]) >= 3:
+                    response_parts.append(f"• وصف الطلب: {request_summary}")
+            except Exception:
+                pass
             if getattr(claim, 'claim_overview', None):
                 text = claim.claim_overview.strip()
                 response_parts.append("• مطالب المدعي كما تظهر من المستند: ")
-                # naive split to bullets for readability, skipping legal evaluation lines
                 excluded_phrases = ["التقييم القانوني", "تحليل قانوني", "تقييم قانوني"]
                 for line in [l.strip('-• \t') for l in text.split('\n') if l.strip()][:10]:
                     if any(phrase in line for phrase in excluded_phrases):
@@ -2243,121 +2262,43 @@ Create a detailed response with these sections:
                     if len([c for c in line if c.isalnum()]) < 2:
                         continue
                     response_parts.append(f"  - {line}")
-            # الطلبات المقدمة - مقتبسة من بيانات الدعوى
             response_parts.append("• الطلبات المقدمة كما وردت في صحيفة الدعوى:")
             requests_lines = []
-
-            # اجمع النصوص المصدرية المحتملة
-            source_snippets: List[str] = []
             if getattr(claim, 'case_requests', None):
-                source_snippets.append(claim.case_requests.strip())
-            reqs_text = ""
-            if extraction_result.raw_text:
+                req_text = claim.case_requests.strip()
+                for line in [l.strip('-• \t') for l in req_text.split('\n') if l.strip()]:
+                    if len([c for c in line if c.isalnum()]) < 2:
+                        continue
+                    requests_lines.append(f"  - {line}")
+                if not requests_lines:
+                    import re as _re
+                    parts = [p.strip() for p in _re.split(r'[،؛\.]', req_text) if p.strip()]
+                    for p in parts[:6]:
+                        requests_lines.append(f"  - {p}")
+            # من أقسام النص المستخرج (الطلبات المقدمة في القضية)
+            if not requests_lines and extraction_result.raw_text:
                 try:
                     from app.modules.claim_extractor.text_processor import TextProcessor as _TP
                     sections = _TP().extract_saudi_legal_sections(extraction_result.raw_text)
                     reqs_text = (sections or {}).get("requests_in_case", "").strip()
                     if reqs_text:
-                        source_snippets.append(reqs_text)
-                except Exception:
-                    pass
-
-            # ضمّن النص الخام كاملاً لتمكين الاستخراج المباشر من الصحيفة
-            if extraction_result.raw_text:
-                source_snippets.append(extraction_result.raw_text.strip())
-            combined_sources = "\n".join([s for s in source_snippets if s])[:12000]
-
-            # حاول استخدام LLM لتنظيف/إعادة كتابة الطلبات باقتباس نص حرفي فقط
-            llm_items: List[str] = []
-            try:
-                if self.openai_processor and combined_sources:
-                    llm_prompt = f"""
-أنت مساعد قانوني. استخرج الطلبات المقدمة كما هي حرفياً من النص أدناه، دون صياغة جديدة أو إضافة معلومات.
-شروط صارمة:
-- استخدم اقتباساً حرفياً لجمل الطلبات من النص المصدر
-- لا تغيّر الكلمات أو ترتيبها، ولا تدمج جُملاً غير متجاورة
-- أزل العناوين العامة مثل: "الطلبات" أو "الطلبات المقدمة في القضية"
-- أزل رموز التعداد (• -) من البداية فقط
-- احذف التكرارات
-- حد أقصى 6 عناصر
-- أعد النتيجة كـ JSON Array فقط بدون أي نص آخر
-
-النص المصدر:
-{combined_sources}
-""".strip()
-                    llm_resp = self.openai_processor.chat.completions.create(
-                        model=self.azure_deployment_name,
-                        messages=[
-                            {"role": "system", "content": "دقيق وممتثل: أعد فقرات الطلبات باقتباس حرفي من النص فقط، بصيغة JSON Array من السلاسل."},
-                            {"role": "user", "content": llm_prompt}
-                        ],
-                        temperature=0.0,
-                        max_tokens=600
-                    )
-                    content = llm_resp.choices[0].message.content.strip()
-                    import json as _json
-                    # نظّف أسوار الشيفرة إن وجدت
-                    if content.startswith('```json'):
-                        content = content[7:]
-                    if content.endswith('```'):
-                        content = content[:-3]
-                    if content.startswith('```'):
-                        content = content[3:]
-                    if content.endswith('```'):
-                        content = content[:-3]
-                    items = _json.loads(content.strip())
-                    if isinstance(items, list):
-                        # تحقّق من أن كل عنصر موجود حرفياً في المصادر
-                        combined_lower = combined_sources
-                        validated = []
-                        for it in items:
-                            if not isinstance(it, str):
-                                continue
-                            cand = it.strip().lstrip('•- ').strip()
-                            if not cand:
-                                continue
-                            if cand in combined_lower:
-                                validated.append(cand)
-                            if len(validated) >= 6:
-                                break
-                        llm_items = validated
-            except Exception:
-                llm_items = []
-
-            if llm_items:
-                requests_lines = [f"  - {it}" for it in llm_items]
-            else:
-                # المسار الحتمي السابق
-                # من الحقول المنظمة
-                if getattr(claim, 'case_requests', None):
-                    req_text = claim.case_requests.strip()
-                    for line in [l.strip('-• \t') for l in req_text.split('\n') if l.strip()]:
-                        if len([c for c in line if c.isalnum()]) < 2:
-                            continue
-                        requests_lines.append(f"  - {line}")
-                    if not requests_lines:
-                        import re as _re
-                        parts = [p.strip() for p in _re.split(r'[،؛\.]', req_text) if p.strip()]
-                        for p in parts[:6]:
-                            requests_lines.append(f"  - {p}")
-                # من أقسام النص المستخرج
-                if not requests_lines and reqs_text:
-                    for line in [l.strip('-• ') for l in reqs_text.split('\n') if l.strip()]:
-                        if len(requests_lines) >= 6:
-                            break
-                        if "الطلبات" in line:
-                            continue
-                        requests_lines.append(f"  - {line}")
-                # من نظرة عامة
-                if not requests_lines and getattr(claim, 'claim_overview', None):
-                    ov = claim.claim_overview.strip()
-                    candidates = [l.strip('-• \t') for l in ov.split('\n') if l.strip()]
-                    for line in candidates:
-                        if any(kw in line for kw in ["الطلب", "طلبات", "إلغاء", "تعويض", "إلزام", "إيقاف", "إلغاء قرار"]):
-                            requests_lines.append(f"  - {line}")
+                        for line in [l.strip('-• ') for l in reqs_text.split('\n') if l.strip()]:
                             if len(requests_lines) >= 6:
                                 break
-
+                            if "الطلبات" in line:
+                                continue
+                            requests_lines.append(f"  - {line}")
+                except Exception:
+                    pass
+            # من نظرة عامة على الدعوى (كخيار أخير)
+            if not requests_lines and getattr(claim, 'claim_overview', None):
+                ov = claim.claim_overview.strip()
+                candidates = [l.strip('-• \t') for l in ov.split('\n') if l.strip()]
+                for line in candidates:
+                    if any(kw in line for kw in ["الطلب", "طلبات", "إلغاء", "تعويض", "إلزام", "إيقاف", "إلغاء قرار"]):
+                        requests_lines.append(f"  - {line}")
+                        if len(requests_lines) >= 6:
+                            break
             if requests_lines:
                 response_parts.extend(requests_lines)
             else:
