@@ -29,6 +29,26 @@ services:
       - MONGODB_DB_NAME=maarefa_agent
       - EMBEDDING_MODEL_TYPE=azure_openai
       - REDIS_URL=redis://redis:6379/0
+      # Azure AI Projects configuration (overridable via .env)
+      - AZURE_AI_PROJECTS_ENDPOINT=${AZURE_AI_PROJECTS_ENDPOINT}
+      - AZURE_AI_PROJECTS_AGENT_ID=${AZURE_AI_PROJECTS_AGENT_ID}
+      # DefaultAzureCredential environment-based auth (optional; recommended for server-side)
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+      # Azure OpenAI (if used elsewhere)
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      - AZURE_OPENAI_DEPLOYMENT_NAME=${AZURE_OPENAI_DEPLOYMENT_NAME}
+      - AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME=${AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME}
+      # Azure Document Intelligence (optional; used by document processing)
+      - AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT=${AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT}
+      - AZURE_DOCUMENT_INTELLIGENCE_KEY=${AZURE_DOCUMENT_INTELLIGENCE_KEY}
+      # Azure Storage (optional)
+      - AZURE_STORAGE_CONNECTION_STRING=${AZURE_STORAGE_CONNECTION_STRING}
+      - AZURE_STORAGE_CONTAINER_NAME=${AZURE_STORAGE_CONTAINER_NAME}
+    env_file:
+      - .env
     depends_on:
       - mongodb
       - redis
@@ -37,6 +57,11 @@ services:
     volumes:
       - .:/app
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
 
 networks:
   app-network:

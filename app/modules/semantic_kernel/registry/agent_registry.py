@@ -8,6 +8,7 @@ from ...agent_kernel.agents.knowledge_qa_agent import KnowledgeQAAgent
 from ...agent_kernel.agents.more_content_agent import MoreContentAgent
 from ...agent_kernel.agents.clarification_agent import ClarificationAgent
 from ...agent_kernel.agents.context_aware_reformulator_agent import ContextAwareReformulatorAgent
+from ...agent_kernel.agents.header_agent import HeaderAgent
 from langgraph.graph import StateGraph, END
 from ....core.config.settings import get_settings
 from ...agent_kernel.core.types import AgentType 
@@ -67,6 +68,11 @@ class AgentRegistry:
             "name": "Phase Advisor",
             "description": "Advises on next steps after legal-basis phase (attachments or proceed to drafting)"
         },
+        "header": {
+            "class": HeaderAgent,
+            "name": "Header Builder",
+            "description": "Deterministically formats pleading header from claim metadata"
+        },
     }
     
 
@@ -79,6 +85,7 @@ class AgentRegistry:
         "context_reformulator": ["default"],
         "legal_basis": ["extract_issues", "search_plan", "analysis", "defense", "update", "pleading"],
         "phase_advisor": ["legal_basis_next_steps"],
+        "header": ["default"],
     }
 
 

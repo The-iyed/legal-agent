@@ -27,6 +27,9 @@ import asyncio
 from app.modules.claim_extractor.service import ClaimExtractorService
 from app.modules.claim_extractor.models import ExtractionResult, ProcessingStatus
 
+# Import response parser
+from app.modules.agent_kernel.utils.response_parser import clean_inline_source_markers
+
 logger = logging.getLogger(__name__)
 
 @dataclass
@@ -1451,6 +1454,12 @@ Create a detailed response with these sections:
             logger.warning(f"Content is not a string, converting: {type(content)} -> {content}")
             content = str(content)
         
+        # Remove inline source artifacts like  from model output
+        try:
+            content = clean_inline_source_markers(content)
+        except Exception as _e:
+            logger.debug(f"clean_inline_source_markers failed: {_e}")
+        
         logger.info(f"Extracted response content ({len(content)} chars)")
         if metadata:
             logger.info(f"Extracted metadata: {list(metadata.keys())}")
@@ -2463,7 +2472,7 @@ Create a detailed response with these sections:
             logger.error(f"Error appending attachments to claim: {e}")
             raise
 
-    def _compose_conversation_title_desc_with_raw(self, claim, raw_text: str | None) -> tuple[str, str]:
+    def _compose_conversation_title_desc_with_raw(self, claim, raw_text: Optional[str]) -> tuple[str, str]:
         """Compose short title and description from claim fields; fallback to raw_text heuristics.
         Title: case_type — case_subject (or رقم <case_number>)
         Description: concise phrase (e.g., 'نزاع تجاري بين شركتين').

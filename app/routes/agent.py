@@ -15,6 +15,11 @@ from pydantic import BaseModel, ConfigDict
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.routes.message import get_message_service
 from app.schemas.conversation import ConversationStatus, ConversationUpdate
+import os
+
+from azure.ai.projects import AIProjectClient
+from azure.identity import DefaultAzureCredential
+from azure.ai.agents.models import ListSortOrder
 
 logger = logging.getLogger(__name__)
 
@@ -598,6 +603,43 @@ async def reload_prompts(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to reload prompts: {str(e)}"
         ) 
+
+class AzureAskRequest(BaseModel):
+    message: str
+
+@router.post(
+    "/azure/ask",
+    response_model=QueryResponse,
+    summary="Ask Azure AI Projects agent",
+    description="Sends a single message to the configured Azure AI Projects agent and returns the response."
+)
+async def azure_ask(request: AzureAskRequest):
+    try:
+        project = AIProjectClient(
+            credential=DefaultAzureCredential(),
+            endpoint=os.getenv(
+                "AZURE_AI_PROJECTS_ENDPOINT",
+                "https://momah-open-ai-project-resource.services.ai.azure.com/api/projects/momah-open-ai-project"
+            )
+        )
+        agent_id = os.getenv("AZURE_AI_PROJECTS_AGENT_ID", "asst_Yr3GKYuAIBoma6rod05Xfs6l")
+        agent = project.agents.get_agent(agent_id)
+        thread = project.agents.threads.create()
+        project.agents.messages.create(thread_id=thread.id, role="user", content=request.message)
+        run = project.agents.runs.create_and_process(thread_id=thread.id, agent_id=agent.id)
+        if run.status == "failed":
+            raise HTTPException(status_code=500, detail=f"Agent run failed: {run.last_error}")
+        msgs = project.agents.messages.list(thread_id=thread.id, order=ListSortOrder.ASCENDING)
+        reply_text = ""
+        for msg in msgs:
+            if getattr(msg, "text_messages", None):
+                reply_text = msg.text_messages[-1].text.value
+        return {"response": reply_text, "metadata": {"thread_id": getattr(thread, "id", None), "agent_id": agent_id}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error calling Azure AI Projects agent: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to call Azure agent: {e}") 
 
 @router.get(
     "/attachments/{conversation_id}/overview",
@@ -1328,20 +1370,116 @@ async def generate_legal_pleading(
         except Exception:
             conv_context = ""
 
-        # Generate via LegalBasisAgent
-        from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry
-        registry = AgentRegistry()
-        agent_class = registry.get_agent_class("legal_basis")
-        if not agent_class:
-            raise HTTPException(status_code=500, detail="LegalBasis agent not registered")
-        agent = agent_class(settings=agent_service.settings)
-        # Inject conversation context into the pleading prompt
-        pleading_prompt = agent.prompt_manager.get_prompt("legal_basis", "pleading") or ""
-        pleading_prompt = pleading_prompt.replace("{{CONV_CONTEXT}}", conv_context)
-        pleading_prompt = pleading_prompt.replace("{{CLAIM_TEXT}}", claim_text or "").replace("{{ATTACHMENTS_TEXT}}", attachments_merged or "").replace("{{FINAL_ANALYSIS}}", final_analysis or "").replace("{{CASE_NUMBER}}", case_number or "—").replace("{{PLAINTIFF_NAME}}", plaintiff_name or "—").replace("{{CLAIM_META}}", claim_meta or "").replace("{{ATTACHMENTS_META}}", attachments_meta or "")
-        pleading = await agent._process_query([{"role": "system", "content": pleading_prompt}])
+        # Build the analysis source from latest analyze or attachments-or-proceed messages
+        latest_analysis = final_analysis or ""
+        try:
+            msgs = await agent_service.message_service.get_conversation_messages(conversation_id, page=1, page_size=200)
+            if msgs and hasattr(msgs, 'messages'):
+                for m in reversed(msgs.messages):
+                    md = m.message_data.get("metadata", {}) if isinstance(m.message_data, dict) else {}
+                    # Use only analysis messages from /legal-basis/analyze or update-with-attachments
+                    if md.get("query_type") in ("legal_basis", "legal_basis_update"):
+                        latest_analysis = m.message_data.get("content", latest_analysis)
+                        break
+        except Exception:
+            pass
 
-        # Store once (idempotent): skip if the same pleading already exists for this conversation
+
+        try:
+            from azure.ai.projects import AIProjectClient
+            from azure.identity import DefaultAzureCredential
+            from azure.ai.agents.models import ListSortOrder
+        
+            project = AIProjectClient(
+                credential=DefaultAzureCredential(),
+                endpoint=os.getenv("AZURE_AI_PROJECTS_ENDPOINT", "https://momah-open-ai-project-resource.services.ai.azure.com/api/projects/momah-open-ai-project")
+            )
+            agent_obj = project.agents.get_agent(os.getenv("AZURE_AI_PROJECTS_AGENT_ID", "asst_Yr3GKYuAIBoma6rod05Xfs6l"))
+            thread = project.agents.threads.create()
+            # Build header via HeaderAgent to avoid hallucination
+            try:
+                from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry
+                registry = AgentRegistry()
+                header_class = registry.get_agent_class("header")
+                header_agent = header_class(settings=agent_service.settings)
+                payload = {
+                    "court": (claim_doc or {}).get("court", "المحكمة الإدارية"),
+                    "case_number": case_number or "—",
+                    "year_h": "1447",
+                    "plaintiff_name": plaintiff_name or "—",
+                    "defendant_name": "وزارة البلديات والإسكان",
+                }
+                import json as _json
+                header_filled = await header_agent._process_query([{"role": "user", "content": _json.dumps(payload, ensure_ascii=False)}])
+            except Exception:
+                _court = (claim_doc or {}).get("court", "المحكمة الإدارية")
+                _year_h = "1447"  # fallback
+                _plaintiff = plaintiff_name or (claim_doc or {}).get("plaintiff_name", "—")
+                _case_no = case_number or (claim_doc or {}).get("case_number", "—")
+                header_filled = (
+                    "رجاءً التزم بهذا القالب النهائي حرفيًا عند توليد المذكرة:\n\n"
+                    f"فضيلة رئيس وأعضاء الدائرة ........ بالمحكمة الإدارية {_court}           سلمهم الله\n"
+                    "السلام عليكم ورحمة الله وبركاته\n"
+                    "مذكرة جوابية مقدمة من وزارة البلديات والإسكان\n"
+                    f"في الدعوى رقم ({_case_no}) لعام {_year_h}هـ\n"
+                    f"المدعي: {_plaintiff}\n"
+                    "المدعى عليها: وزارة البلديات والإسكان\n"
+                )
+            composed_prompt = (
+                "THIS IS THE ANALYZE (latest):\n" + (latest_analysis or "غير متوفر") + "\n\n" +
+                "[CLAIM RAW TEXT]:\n" + (claim_text or "غير متوفر") + "\n\n" +
+                "THIS IS YOUR INSTRUCTIONS:\n" +
+                "أنت مساعد قانوني محترف وعبقري متخصص في أنظمة المرافعات السعودية، وتعمل وكأنك محامي مخضرم هدفه صياغة دفوع قوية تجعل المدعي يخسر الدعوى.\n\n"
+                "يجب أن تستند إجاباتك فقط على الوثائق التالية الموجودة في قاعدة المعرفة:\n- نظام المرافعات أمام ديوان المظالم ولائحته التنفيذية.\n- نظام المرافعات الشرعية ولوائحه التنفيذية.\n\n"
+                "إذا لم تجد الإجابة في هذه المستندات، قل حرفيًا: \"المعلومة غير متوفرة في المستندات المقدمة.\"\n\n"
+                "لا تستخدم أي مصادر خارجية أو معلومات قانونية غير موجودة في المستندات المرفوعة.\n\n---\n\n"
+                "## عند الرد على أي دعوى أو وقائع، يجب أن تقوم بما يلي:\n1. تحليل الدعوى وفق المستندات المرفوعة.\n2. تحديد المواد النظامية واللائحية ذات الصلة.\n3. صياغة دفع شكلي ودفع موضوعي معًا بأسلوب محامي محترف ومقنع.\n\n---\n\n"
+                "EXAMPLE OF STRUCTURE : ### أولًا: الدفع الشكلي\nالدفع الشكلي\nاستنادًا إلى المادة (5) من نظام المرافعات أمام ديوان المظالم، والمادة (3) من لائحته التنفيذية، وكذلك المادة (76) من نظام المرافعات الشرعية، والمادة (80) من لائحته التنفيذية، ندفع بعدم قبول الدعوى شكلاً، وذلك للأسباب التالية:\n\n- انتفاء الصفة النظامية للمدعي، إذ أن القلاب محل المخالفة لا تعود ملكيته له، وإنما هو مستأجر من قبل مقاول فرعي متعاقد ضمن مشروع حكومي، ولا يربط المدعي بالجهة المدعى عليها أي علاقة مباشرة أو نظامية تخوله صفة الخصومة.\n- عدم قيام المصلحة الشخصية المباشرة، حيث لم يُثبت المدعي وقوع ضرر نظامي مباشر عليه نتيجة القرار محل الدعوى، كما أن المخالفة تتعلق بإجراء تنظيمي لا يمس مركزه القانوني الخاص.\n- توجيه الدعوى إلى غير ذي صفة، فالقرار محل الاعتراض تم تحريره من قبل بلدية الشمال وفق صلاحياتها الرقابية والتنفيذية، وليس من أمانة منطقة الرياض بصفتها التنظيمية العليا، مما يفقد الدعوى شرط الاختصام الصحيح.\n\nوعليه، نلتمس الحكم بعدم قبول الدعوى لقيامها على غير ذي صفة.\n\n"
+                "### ثانيًا: الدفع الموضوعي\nالدفع الموضوعي\n[أدرج الأسباب مذكورة مع المادة ورقمها من النظام أو اللائحة].\n\n"
+                "---\n\n"
+                + header_filled +
+                ".................................................\n"
+                "............................................\n"
+                "..................................\n"
+                "الدفع الشكلي على الدعوى: (عدم قبول الدعوى أما لرفعها قبل أوانها أو عدم الصفة ، او انتفاء المصلحة أو سبق الفصل بها وغيرها من الدفوع الشكلية المعتبرة)\n"
+                "أولاً: ……………………………………………...\n"
+                "ثانياً: ……………………………………..\n"
+                "الدفع الموضوعي : إذا استلزم ذلك\n"
+                "أولاً: .................................\n"
+                "ثانياً: .................................\n\n"
+                "الخلاصة: …………………………………………...\n"
+                "الطلبات:\n"
+                "نطلب بعدم قبول الدعوى شكلاً ........................\n"
+                "رفض الدعوى موضوعاً..........................\n\n"
+                "                                                                                ممثل وزارة البلديات والإسكان\n"
+                "                                                                                 \n"
+                "                                                                 .................................\n"
+            )
+            project.agents.messages.create(thread_id=thread.id, role="user", content=composed_prompt)
+            run = project.agents.runs.create_and_process(thread_id=thread.id, agent_id=agent_obj.id)
+            if run.status == "failed":
+                raise HTTPException(status_code=500, detail=f"Pleading agent run failed: {run.last_error}")
+            msgs = project.agents.messages.list(thread_id=thread.id, order=ListSortOrder.ASCENDING)
+            pleading = ""
+            for msg in msgs:
+                if msg.text_messages:
+                    pleading = msg.text_messages[-1].text.value
+            if not pleading:
+                pleading = "تعذر توليد لائحة الرد من العميل الذكي." 
+        except Exception as e:
+            logger.warning(f"Azure AI Projects agent failed, falling back to SK agent: {e}")
+            from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry
+            registry = AgentRegistry()
+            agent_class = registry.get_agent_class("legal_basis")
+            if not agent_class:
+                raise HTTPException(status_code=500, detail="LegalBasis agent not registered")
+            agent = agent_class(settings=agent_service.settings)
+            pleading_prompt = agent.prompt_manager.get_prompt("legal_basis", "pleading") or ""
+            pleading_prompt = pleading_prompt.replace("{{CONV_CONTEXT}}", conv_context)
+            pleading_prompt = pleading_prompt.replace("{{CLAIM_TEXT}}", claim_text or "").replace("{{ATTACHMENTS_TEXT}}", attachments_merged or "").replace("{{FINAL_ANALYSIS}}", latest_analysis or "").replace("{{CASE_NUMBER}}", case_number or "—").replace("{{PLAINTIFF_NAME}}", plaintiff_name or "—").replace("{{CLAIM_META}}", claim_meta or "").replace("{{ATTACHMENTS_META}}", attachments_meta or "")
+            pleading = await agent._process_query([{"role": "system", "content": pleading_prompt}])
+
+
         stored_ok = False
         try:
             existing = await agent_service.message_service.collection.find_one({
@@ -1383,7 +1521,7 @@ async def generate_legal_pleading(
         )
 
         combined = pleading + "\n\n---\n" + followup
-        return {"response": combined, "metadata": {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0, "stored_ok": stored_ok}}
+        return {"response": combined, "metadata": {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0, "stored_ok": stored_ok, "query_type": "pleading_response"}}
 
     except HTTPException:
         raise

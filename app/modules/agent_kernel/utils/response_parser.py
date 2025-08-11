@@ -192,3 +192,21 @@ def parse_all_in_one_response(llm_response: str) -> Tuple[str, str, List[str]]:
         return llm_response, "", []
 
     return answer, sources_markdown, related_questions 
+
+def clean_inline_source_markers(text: str) -> str:
+  
+    
+    try:
+        if not text:
+            return text
+        # Common patterns: , , with potential spaces
+        text = re.sub(r"【\s*\d+(?::\d+)?\s*†source】", "", text)
+        # Fallback: remove any bracket that contains the '†source' token
+        text = re.sub(r"【[^】]*†source】", "", text)
+        # Normalize whitespace/newlines
+        text = re.sub(r"[ \t]{2,}", " ", text)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+    except Exception as e:
+        logger.warning(f"Failed to clean inline source markers: {e}")
+        return text 

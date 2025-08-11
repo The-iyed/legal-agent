@@ -480,3 +480,61 @@ Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduc
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. 
+
+# Maarefa Agent V2 API
+
+## Quick start (Docker)
+
+1. Create a `.env` file at repo root with your Azure credentials and agent IDs:
+
+```
+AZURE_AI_PROJECTS_ENDPOINT=https://momah-open-ai-project-resource.services.ai.azure.com/api/projects/momah-open-ai-project
+AZURE_AI_PROJECTS_AGENT_ID=asst_Yr3GKYuAIBoma6rod05Xfs6l
+# DefaultAzureCredential (service principal)
+AZURE_TENANT_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+AZURE_CLIENT_ID=yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
+AZURE_CLIENT_SECRET=your_secret_value
+
+# Optional (if used elsewhere in app)
+AZURE_OPENAI_ENDPOINT=
+AZURE_OPENAI_API_KEY=
+AZURE_OPENAI_DEPLOYMENT_NAME=
+AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME=
+AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT=
+AZURE_DOCUMENT_INTELLIGENCE_KEY=
+AZURE_STORAGE_CONNECTION_STRING=
+AZURE_STORAGE_CONTAINER_NAME=leg-files
+```
+
+2. Rebuild and start services:
+
+```
+docker compose build --no-cache
+docker compose up -d mongodb redis tachriat-app
+```
+
+3. Check health:
+
+```
+curl -f http://localhost:8017/health
+```
+
+4. Test the Azure agent endpoint:
+
+```
+curl -X POST http://localhost:8017/api/agents/azure/ask \
+  -H 'Content-Type: application/json' \
+  -d '{"message":"Hi Agent628"}'
+```
+
+5. Test generate pleading:
+
+```
+curl -X POST http://localhost:8017/api/agents/legal-basis/generate-pleading \
+  -H 'Content-Type: application/json' \
+  -d '{"conversation_id":"<your_conversation_id>"}'
+```
+
+Notes:
+- The app uses `DefaultAzureCredential`. In containers, a service principal via env vars is recommended.
+- Compose passes `.env` into the app container automatically. Update `.env` then `docker compose up -d` to apply. 
