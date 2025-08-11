@@ -1490,6 +1490,7 @@ async def generate_legal_pleading(
                 "                                                                                ممثل وزارة البلديات والإسكان\n"
                 "                                                                                 \n"
                 "                                                                 .................................\n"
+                "NOTE: DO NOT USE ANY 【...】 BLOCKS IN THE PLEADING. THIS IS VERY IMPORTANT."
             )
             project.agents.messages.create(thread_id=thread.id, role="user", content=composed_prompt)
             run = project.agents.runs.create_and_process(thread_id=thread.id, agent_id=agent_obj.id)
