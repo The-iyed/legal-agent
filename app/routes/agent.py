@@ -209,12 +209,12 @@ async def upload_file(
                 detail="No file provided"
             )
 
-        # Check file size (limit to 10MB)
+        # Check file size (limit to 100MB)
         file_content = await file.read()
-        if len(file_content) > 10 * 1024 * 1024:  # 10MB
+        if len(file_content) > 100 * 1024 * 1024:  # 100MB
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="File size too large. Maximum size is 10MB."
+                detail="File size too large. Maximum size is 100MB."
             )
 
         # Process file upload
@@ -312,7 +312,7 @@ async def upload_attachments(
                 detail="No files provided"
             )
 
-        # Check total file size (limit to 50MB for multiple files)
+        # Check total file size (limit to 200MB for multiple files)
         total_size = 0
         for file in files:
             file_content = await file.read()
@@ -320,11 +320,29 @@ async def upload_attachments(
             # Reset file position for later processing
             await file.seek(0)
             
-        if total_size > 50 * 1024 * 1024:  # 50MB
+        if total_size > 200 * 1024 * 1024:  # 200MB
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Total file size too large. Maximum size is 50MB for all attachments."
+                detail="Total file size too large. Maximum size is 200MB for all attachments."
             )
+
+        # Normalize files: drop empty
+        files = [f for f in (files or []) if getattr(f, "filename", None)]
+        # Size limits: 100MB per file, 200MB total
+        try:
+            total_size = 0
+            for f in files:
+                content = await f.read()
+                total_size += len(content)
+                if len(content) > 100 * 1024 * 1024:
+                    raise HTTPException(status_code=400, detail=f"Attachment '{f.filename}' exceeds 100MB limit")
+                await f.seek(0)
+            if total_size > 200 * 1024 * 1024:
+                raise HTTPException(status_code=400, detail="Total attachments size exceeds 200MB limit")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
 
         # Process attachments
         attachment_results = await agent_service.process_attachments(

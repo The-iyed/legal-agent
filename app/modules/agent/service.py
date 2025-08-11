@@ -270,14 +270,29 @@ class AgentService:
                     conversation_id,
                     ConversationStatus.CLAIM_DISCUSSION
                 )
-                # Build extracted fields object for metadata/UI
+                # Build extracted fields object for metadata/UI (fallback)
                 ex_fields_cached = {k: cached_data.get(k) for k in [
                     "case_number", "case_subject", "case_type", "plaintiff_name", "defendant_name", "filing_date", "court"
                 ] if cached_data.get(k)}
+                # Also attempt to parse Arabic structured fields from cached response
+                kv_map_cached = {}
+                try:
+                    for line in (cached_response or '').split('\n'):
+                        if ':' in line:
+                            k, v = line.split(':', 1)
+                            kv_map_cached[k.strip().lstrip('-').strip()] = v.strip().strip('*').strip()
+                except Exception:
+                    kv_map_cached = {}
                 # Store agent response quickly
                 await self._store_agent_message(
                     cached_response,
-                    {"query_type": "file", "file_processed": True, "is_valid": is_valid_cached, "extracted_fields": ex_fields_cached},
+                    {
+                        "query_type": "file",
+                        "file_processed": True,
+                        "is_valid": is_valid_cached,
+                        "extracted_fields": (kv_map_cached or ex_fields_cached),
+                        **({"structured_fields": kv_map_cached} if kv_map_cached else {})
+                    },
                     conversation_id,
                     {"agent_type": "claim_extractor", "confidence": cached_data.get("validation_score", 0.0)}
                 )
@@ -295,7 +310,8 @@ class AgentService:
                         "total_pages": cached_data.get("total_pages", 1),
                         "processing_time": cached_data.get("processing_time"),
                         "extraction_status": cached_data.get("extraction_status", "completed"),
-                        "extracted_fields": ex_fields_cached
+                        "extracted_fields": (kv_map_cached or ex_fields_cached),
+                        **({"structured_fields": kv_map_cached} if kv_map_cached else {})
                     }
                 )
             
@@ -362,7 +378,7 @@ class AgentService:
             except Exception:
                 kv_map = {}
             
-            # Extract key fields deterministically for metadata/UI
+            # Extract key fields deterministically for metadata/UI (fallback)
             ex_fields = {k: extracted_data.get(k) for k in [
                 "case_number", "case_subject", "case_type", "plaintiff_name", "defendant_name", "filing_date", "court"
             ] if extracted_data.get(k)}
@@ -371,7 +387,8 @@ class AgentService:
                 "query_type": "file",
                 "file_processed": True,
                 "is_valid": (extraction_result.extracted_claim.is_valid if extraction_result.extracted_claim else False),
-                "extracted_fields": ex_fields,
+                "extracted_fields": (kv_map or ex_fields),
+                **({"structured_fields": kv_map} if kv_map else {}),
             }
             if kv_map:
                 base_metadata["structured_fields"] = kv_map
@@ -395,7 +412,7 @@ class AgentService:
                     "processing_time": extraction_result.processing_time,
                     "extraction_status": extraction_result.status.value,
                     **({"structured_fields": kv_map} if kv_map else {}),
-                    "extracted_fields": ex_fields,
+                    "extracted_fields": (kv_map or ex_fields),
                 }
             )
             
