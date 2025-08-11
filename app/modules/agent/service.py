@@ -28,7 +28,7 @@ from app.modules.claim_extractor.service import ClaimExtractorService
 from app.modules.claim_extractor.models import ExtractionResult, ProcessingStatus
 
 # Import response parser
-from app.modules.agent_kernel.utils.response_parser import clean_inline_source_markers
+from app.modules.agent_kernel.utils.response_parser import clean_inline_source_markers, normalize_pleading_phrasing
 
 logger = logging.getLogger(__name__)
 
@@ -1457,8 +1457,9 @@ Create a detailed response with these sections:
         # Remove inline source artifacts like  from model output
         try:
             content = clean_inline_source_markers(content)
+            content = normalize_pleading_phrasing(content)
         except Exception as _e:
-            logger.debug(f"clean_inline_source_markers failed: {_e}")
+            logger.debug(f"response normalization failed: {_e}")
         
         logger.info(f"Extracted response content ({len(content)} chars)")
         if metadata:

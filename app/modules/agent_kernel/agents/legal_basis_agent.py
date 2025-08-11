@@ -206,7 +206,7 @@ class LegalBasisAgent(BaseAgent):
             analysis = await self._stage_analysis(claim_text, attachments_text, issues, laws, attachment_filenames)
             defense = await self._stage_defense(analysis, laws)
             response = (
-                "🎯 الأساس القانوني للدعوى (ملخص منظم)\n\n" + analysis.strip() + "\n\n"
+                "🎯 الأساس القانوني للدعوى   \n\n" + analysis.strip() + "\n\n"
                 "🛡️ نقاط الدفاع المقترحة للبلدية\n\n" + defense.strip()
             )
             return {"response": {"content": response, "metadata": {"agent_type": self.agent_type}}, "status": "success"}
@@ -257,7 +257,7 @@ class LegalBasisAgent(BaseAgent):
             analysis = self._sanitize_output(analysis)
             defense = self._sanitize_output(defense)
             response = (
-                "🎯 الأساس القانوني للدعوى (ملخص منظم)\n\n" + analysis.strip() + "\n\n"
+                "🎯 الأساس القانوني للدعوى   \n\n" + analysis.strip() + "\n\n"
                 "🛡️ نقاط الدفاع المقترحة للبلدية\n\n" + defense.strip()
             )
             return {"response": {"content": response, "metadata": {"agent_type": self.agent_type}}, "status": "success"}

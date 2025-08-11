@@ -194,19 +194,40 @@ def parse_all_in_one_response(llm_response: str) -> Tuple[str, str, List[str]]:
     return answer, sources_markdown, related_questions 
 
 def clean_inline_source_markers(text: str) -> str:
-  
-    
+    """Remove Azure AI Projects/Agents inline citation artifacts such as '' or '' from text.
+    Also collapses excessive whitespace after removal.
+    """
     try:
         if not text:
             return text
-        # Common patterns: , , with potential spaces
+        # Remove any bracket that contains a dagger † (e.g., )
+        text = re.sub(r"【[^】]*†[^】]*】", "", text)
+        # Legacy patterns
         text = re.sub(r"【\s*\d+(?::\d+)?\s*†source】", "", text)
-        # Fallback: remove any bracket that contains the '†source' token
         text = re.sub(r"【[^】]*†source】", "", text)
+        # Final catch-all: remove ANY 【...】 blocks
+        text = re.sub(r"【[^】]*】", "", text)
         # Normalize whitespace/newlines
         text = re.sub(r"[ \t]{2,}", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
     except Exception as e:
         logger.warning(f"Failed to clean inline source markers: {e}")
+        return text
+
+
+def normalize_pleading_phrasing(text: str) -> str:
+    """Normalize Arabic pleading phrasing to avoid 'نطلب الحكم ...'.
+    - Replace 'الحكم بعدم قبول الدعوى[ شكلاً]' with 'نطلب بعدم قبول الدعوى[ شكلاً]'
+    - Replace 'الحكم برفض الدعوى' with 'نطلب رفض الدعوى'
+    """
+    try:
+        if not text:
+            return text
+        # Keep any trailing qualifier like 'شكلاً'
+        text = re.sub(r"الحكم\s+بعدم\s+قبول\s+الدعوى(\s*شكلاً)?", lambda m: "نطلب بعدم قبول الدعوى" + (m.group(1) or ""), text)
+        text = re.sub(r"الحكم\s+برفض\s+الدعوى", "نطلب رفض الدعوى", text)
+        return text
+    except Exception as e:
+        logger.warning(f"Failed to normalize pleading phrasing: {e}")
         return text 

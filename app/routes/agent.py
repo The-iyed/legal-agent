@@ -868,8 +868,17 @@ async def analyze_legal_basis(
             )
         except Exception as e:
             logger.warning(f"Failed to store legal basis message: {e}")
+ 
+        try:
+            db = agent_service.db
+            atts = []
+            cursor = db.attachments.find({"conversation_id": request.conversation_id}).sort("created_at", -1).limit(20)
+            async for a in cursor:
+                atts.append({"name": a.get("filename"), "link": a.get("file_url"), "size": a.get("file_size")})
+        except Exception:
+            atts = []
 
-        return {"response": content, "metadata": {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0, "attachment_citations": citations, "inline_citations": inline_citations, "recommended_attachments": recommended, "relevance": {"used": relevant_files, "unused": irrelevant_files}}}
+        return {"response": content, "metadata": {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0, "attachment_citations": citations, "inline_citations": inline_citations, "recommended_attachments": recommended, "relevance": {"used": relevant_files, "unused": irrelevant_files}, "attachments": atts}}
 
     except HTTPException:
         raise
@@ -943,7 +952,18 @@ async def update_legal_basis_with_attachments(
             {"agent_type": "legal_basis", "prompt_type": "update", "confidence": 1.0}
         )
 
-        return {"response": addendum, "metadata": {"agent_type": "legal_basis", "prompt_type": "update", "confidence": 1.0}}
+        # Attach structured attachments for UI
+        try:
+            db = agent_service.db
+            atts = []
+            cursor = db.attachments.find({"conversation_id": conversation_id}).sort("created_at", -1).limit(20)
+            async for a in cursor:
+                atts.append({"name": a.get("filename"), "link": a.get("file_url"), "size": a.get("file_size")})
+        except Exception:
+            atts = []
+
+        return {"response": addendum, "metadata": {"agent_type": "legal_basis", "prompt_type": "update", "confidence": 1.0, "attachments": atts}}
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1263,6 +1283,20 @@ async def finalize_legal_basis(
 
         content = result.get("response", {}).get("content", "")
 
+        # Collect attachments info for UI (name/link/size)
+        atts: List[dict] = []
+        try:
+            db = agent_service.db
+            cursor = db.attachments.find({"conversation_id": conversation_id}).sort("created_at", -1).limit(20)
+            async for a in cursor:
+                atts.append({
+                    "name": a.get("filename"),
+                    "link": a.get("file_url"),
+                    "size": a.get("file_size")
+                })
+        except Exception:
+            atts = []
+
         try:
             await conversation_service.update_conversation_status(conversation_id, ConversationStatus.RESPONSE_DRAFTING)
         except Exception:
@@ -1270,12 +1304,12 @@ async def finalize_legal_basis(
 
         await agent_service._store_agent_message(
             content,
-            {"query_type": "legal_basis_final", "search": "azure_ai_search", "attachments_count_considered": len(attachments_texts)},
+            {"query_type": "legal_basis_final", "search": "azure_ai_search", "attachments_count_considered": len(attachments_texts), "attachments": atts},
             conversation_id,
             {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0}
         )
 
-        return {"response": content, "metadata": {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0}}
+        return {"response": content, "metadata": {"agent_type": "legal_basis", "prompt_type": "analysis", "confidence": 1.0, "attachments": atts}}
     except HTTPException:
         raise
     except Exception as e:
@@ -1408,6 +1442,7 @@ async def generate_legal_pleading(
                     "year_h": "1447",
                     "plaintiff_name": plaintiff_name or "—",
                     "defendant_name": "وزارة البلديات والإسكان",
+                    "conversation_id": conversation_id,
                 }
                 import json as _json
                 header_filled = await header_agent._process_query([{"role": "user", "content": _json.dumps(payload, ensure_ascii=False)}])
@@ -1438,6 +1473,7 @@ async def generate_legal_pleading(
                 "### ثانيًا: الدفع الموضوعي\nالدفع الموضوعي\n[أدرج الأسباب مذكورة مع المادة ورقمها من النظام أو اللائحة].\n\n"
                 "---\n\n"
                 + header_filled +
+                "وقائع القضية:\n"
                 ".................................................\n"
                 "............................................\n"
                 "..................................\n"
