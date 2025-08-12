@@ -2612,8 +2612,9 @@ Create a detailed response with these sections:
 
     async def _add_header_and_clean(self, body_text: str, claim_doc: Dict[str, Any]) -> str:
         """Post-process a pleading body by adding a formal header from claim metadata and cleaning any citation artifacts.
-        - Uses a deterministic header template exactly as requested.
-        - Removes inline citation markers like 【...】, [doc_1], code fences from the body.
+        - Uses a bold markdown header generated from the claim raw_text via Azure OpenAI when available.
+        - Falls back to a deterministic bold header template if extraction fails.
+        - Cleans inline citation markers and code fences from the body only.
         - Preserves header spacing and formatting.
         """
         try:
@@ -2634,23 +2635,77 @@ Create a detailed response with these sections:
             except Exception:
                 pass
 
-            case_number = (claim_doc or {}).get("case_number") or ""
-            plaintiff_name = (claim_doc or {}).get("plaintiff_name") or ""
+            # Try to get claim raw text for header extraction
+            claim_raw = (claim_doc or {}).get("raw_text") or ""
+            if not claim_raw:
+                try:
+                    conv_id = (claim_doc or {}).get("conversation_id")
+                    if conv_id:
+                        doc = await self.db.statement_of_claim.find_one({"conversation_id": conv_id})
+                        if doc:
+                            claim_raw = doc.get("raw_text", "") or ""
+                except Exception:
+                    claim_raw = ""
 
-            # Build exact header template with fallbacks for missing values
-            cn = case_number if case_number.strip() else "....."
-            pl = plaintiff_name if plaintiff_name.strip() else "............................."
+            header_text = ""
+            # If Azure OpenAI available, ask it to build the bold header from raw claim text
+            if getattr(self, "openai_processor", None) and getattr(self, "azure_deployment_name", None) and claim_raw:
+                try:
+                    system_prompt = (
+                        "أنت مساعد قانوني. من النص التالي (صحيفة الدعوى) استخرج المحكمة، رقم الدعوى، واسم المدعي." \
+                        " أعِد فقط الترويسة التالية بصيغة ماركداون وبالخط العريض (سطر لكل بند)، مع استبدال القيم المستخرجة،" \
+                        " وإذا تعذر الاستخراج استعمل النقاط كما في القالب. لا تُرجع أي نص أو شرح إضافي ولا تستخدم كتل كود."
+                    )
+                    # Keep year as 1447 per template requirement
+                    user_prompt = (
+                        "القالب المطلوب:\n"
+                        "**فضيلة رئيس وأعضاء الدائرة ........ بالمحكمة الإدارية {المحكمة}           سلمهم الله**\n"
+                        "**السلام عليكم ورحمة الله وبركاته**\n"
+                        "**مذكرة جوابية مقدمة من وزارة البلديات والإسكان**\n"
+                        "**في الدعوى رقم ({رقم_الدعوى}) لعام 1447هـ**\n"
+                        "**المدعي: {اسم_المدعي}**  \n"
+                        "**المدعى عليها: ----**\n\n"
+                        "نص صحيفة الدعوى للتحليل:\n" + (claim_raw[:120000])
+                    )
+                    comp = self.openai_processor.chat.completions.create(
+                        model=self.azure_deployment_name,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        temperature=0.0,
+                        max_tokens=600,
+                    )
+                    header_text = (comp.choices[0].message.content or "").strip()
+                    # Remove any accidental fences
+                    try:
+                        import re as _re
+                        if header_text.startswith("```"):
+                            header_text = _re.sub(r"^```[a-zA-Z]*\\s*|```$", "", header_text).strip()
+                    except Exception:
+                        pass
+                except Exception as _e:
+                    logger.warning(f"LLM header generation failed; using fallback: {_e}")
+                    header_text = ""
 
-            header = (
-                "فضيلة رئيس وأعضاء الدائرة ........ بالمحكمة الإدارية..........           سلمهم الله\n"
-                "السلام عليكم ورحمة الله وبركاته\n"
-                "مذكرة جوابية مقدمة من وزارة البلديات والإسكان\n"
-                f"في الدعوى رقم ({cn}) لعام 1447هـ\n"
-                f"المدعي: {pl}  \n"
-                "المدعى عليها: وزارة البلديات والإسكان\n"
-            )
+            # Deterministic bold fallback
+            if not header_text:
+                case_number = (claim_doc or {}).get("case_number") or ""
+                plaintiff_name = (claim_doc or {}).get("plaintiff_name") or ""
+                court_name = (claim_doc or {}).get("court") or ""
+                cn = case_number.strip() if case_number.strip() else "....."
+                pl = plaintiff_name.strip() if plaintiff_name.strip() else "............................."
+                court = court_name.strip() if court_name.strip() else ".........."
+                header_text = (
+                    f"**فضيلة رئيس وأعضاء الدائرة ........ بالمحكمة الإدارية{court}           سلمهم الله**\n"
+                    f"**السلام عليكم ورحمة الله وبركاته**\n"
+                    f"**مذكرة جوابية مقدمة من -----ن**\n"
+                    f"**في الدعوى رقم ({cn}) لعام 1447هـ**\n"
+                    f"**المدعي: {pl}**  \n"
+                    f"**المدعى عليها: -----ن**\n"
+                )
 
-            final_text = header + "\n" + cleaned_body.strip()
+            final_text = header_text + "\n\n" + cleaned_body.strip()
 
             # Final phrasing normalization (does not touch spacing sequences)
             try:
