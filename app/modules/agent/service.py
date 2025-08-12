@@ -2688,7 +2688,7 @@ Create a detailed response with these sections:
                     logger.warning(f"LLM header generation failed; using fallback: {_e}")
                     header_text = ""
 
-            # Deterministic bold fallback
+            
             if not header_text:
                 case_number = (claim_doc or {}).get("case_number") or ""
                 plaintiff_name = (claim_doc or {}).get("plaintiff_name") or ""
