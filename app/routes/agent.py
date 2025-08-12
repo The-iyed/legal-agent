@@ -1474,6 +1474,15 @@ async def generate_legal_pleading(
         # Pass 2: Add header and clean citations using Azure OpenAI (or deterministic fallback)
         final_pleading = await agent_service._add_header_and_clean(pleading_body, claim_doc or {})
 
+        # Pass 3: Generate خاتمة وطلبات via separate ConclusionAgent
+        try:
+            from app.modules.agent_kernel.agents.conclusion_agent import ConclusionAgent
+            conclusion_agent = ConclusionAgent(settings=agent_service.settings)
+            conclusion_text = await conclusion_agent.generate(latest_analysis or final_analysis or "", claim_text or "", attachments_merged or "")
+        except Exception as e:
+            logger.warning(f"ConclusionAgent failed: {e}")
+            conclusion_text = "الخلاصة: …\n\nالطلبات:\n- عدم قبول الدعوى شكلاً (إن توافرت أسبابه)\n- رفض الدعوى موضوعاً"
+
         stored_ok = False
         try:
             existing = await agent_service.message_service.collection.find_one({
@@ -1514,7 +1523,7 @@ async def generate_legal_pleading(
             {"agent_type": "chat", "prompt_type": "default", "confidence": 1.0}
         )
 
-        combined = final_pleading + "\n\n---\n" + followup
+        combined = final_pleading + "\n\n" + conclusion_text.strip() + "\n\n---\n" + followup
         return {"response": combined, "metadata": {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0, "stored_ok": stored_ok, "query_type": "pleading_response"}}
 
     except HTTPException:
