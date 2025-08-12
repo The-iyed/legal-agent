@@ -239,8 +239,8 @@ def enforce_arabic_ordinals_in_defense_sections(text: str) -> str:
     Strategy:
     - Detect entry into either section when a line contains a header for it.
     - While inside the section, transform top-level bullet/numbered list lines to ordinal-prefixed lines.
-    - Also split inline occurrences like "أولاً: …؛ ثانياً: …" into separate lines.
-    - Use bold+underline formatting for ordinal labels via HTML: <u><strong>أولاً:</strong></u>.
+    - Also split inline occurrences like "أولاً: …؛ ثانياً: …" or "أولاً: … ثانياً: …" into separate lines.
+    - Use Markdown bold formatting for ordinal labels: **أولاً:** (HTML may be escaped in the client).
     - Stop when another major section header is detected (الخلاصة، الطلبات، الوقائع، etc.).
     - Leave already formatted prefixes intact.
     """
@@ -273,11 +273,12 @@ def enforce_arabic_ordinals_in_defense_sections(text: str) -> str:
         ord_group = "|".join([re.escape(o) for o in arabic_ordinals])
         start_prefix_re = re.compile(rf"^\s*((?:{ord_group})\s*:)\s*")
         inline_prefix_re = re.compile(rf"[؛;،]\s*((?:{ord_group})\s*:)\s*")
+        mid_prefix_re = re.compile(rf"\s+((?:{ord_group})\s*:)\s*")
  
         def format_prefix(prefix: str) -> str:
             p = prefix.strip()
-            # Bold + underline using HTML to guarantee underline rendering
-            return f"<u><strong>{p}</strong></u>"
+            # Markdown bold for better compatibility
+            return f"**{p}**"
  
         def leading_spaces(s: str) -> int:
             m = re.match(r"^(\s*)", s)
@@ -312,12 +313,13 @@ def enforce_arabic_ordinals_in_defense_sections(text: str) -> str:
                     output_lines.append(line)
                     continue
  
-                # Case A: inline ordinals in a single sentence (e.g., "أولاً: …؛ ثانياً: …")
-                if start_prefix_re.search(line) or inline_prefix_re.search(line):
+                # Case A: inline ordinals in a single sentence (e.g., "أولاً: …؛ ثانياً: …" or with space)
+                if start_prefix_re.search(line) or inline_prefix_re.search(line) or mid_prefix_re.search(line):
                     # Ensure first prefix is formatted at line start
                     new_line = start_prefix_re.sub(lambda m: format_prefix(m.group(1)) + " ", line, count=1)
                     # Split subsequent prefixes into newlines, each formatted
                     new_line = inline_prefix_re.sub(lambda m: "\n" + format_prefix(m.group(1)) + " ", new_line)
+                    new_line = mid_prefix_re.sub(lambda m: "\n" + format_prefix(m.group(1)) + " ", new_line)
                     split_lines = new_line.split("\n")
                     for sl in split_lines:
                         output_lines.append(sl.rstrip())
@@ -337,11 +339,9 @@ def enforce_arabic_ordinals_in_defense_sections(text: str) -> str:
                     ordinal_index += 1
                     continue
  
-                # Otherwise, pass-through
                 output_lines.append(line)
                 continue
  
-            # Outside defense sections
             output_lines.append(line)
  
         return "\n".join(output_lines)
