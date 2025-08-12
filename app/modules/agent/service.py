@@ -716,38 +716,32 @@ class AgentService:
     async def _upload_file_to_blob(self, file_content: bytes, filename: str, conversation_id: str, folder: str = "claims") -> str:
         """Upload file to Azure Blob Storage with folder organization."""
         try:
-            # Check if Azure Storage is configured
+            # If no storage configured, return mock URL (non-blocking)
             if not self.settings.AZURE_STORAGE_CONNECTION_STRING:
                 logger.warning("Azure Storage connection string not configured, using mock file URL")
-                # Return a mock file URL when Azure Storage is not configured
                 file_extension = filename.split('.')[-1] if '.' in filename else 'pdf'
                 mock_blob_name = f"{folder}/{conversation_id}/{uuid.uuid4()}.{file_extension}"
                 return f"https://mock-storage.blob.core.windows.net/{self.settings.AZURE_STORAGE_CONTAINER_NAME}/{mock_blob_name}"
-            
-            # Initialize blob service client
-            blob_service_client = BlobServiceClient.from_connection_string(
-                self.settings.AZURE_STORAGE_CONNECTION_STRING
-            )
-            
-            # Get container client
-            container_client = blob_service_client.get_container_client(
-                self.settings.AZURE_STORAGE_CONTAINER_NAME
-            )
-            
-            # Create unique blob name with folder structure
-            file_extension = filename.split('.')[-1] if '.' in filename else 'pdf'
-            blob_name = f"{folder}/{conversation_id}/{uuid.uuid4()}.{file_extension}"
-            
-            # Upload file
-            blob_client = container_client.get_blob_client(blob_name)
-            blob_client.upload_blob(file_content, overwrite=True)
-            
-            # Return blob URL from SDK (avoids requiring account name in settings)
-            return str(blob_client.url)
-            
+
+            # Run blocking Azure SDK upload in a worker thread to avoid freezing event loop
+            def _sync_upload() -> str:
+                blob_service_client = BlobServiceClient.from_connection_string(
+                    self.settings.AZURE_STORAGE_CONNECTION_STRING
+                )
+                container_client = blob_service_client.get_container_client(
+                    self.settings.AZURE_STORAGE_CONTAINER_NAME
+                )
+                file_extension = filename.split('.')[-1] if '.' in filename else 'pdf'
+                blob_name = f"{folder}/{conversation_id}/{uuid.uuid4()}.{file_extension}"
+                blob_client = container_client.get_blob_client(blob_name)
+                blob_client.upload_blob(file_content, overwrite=True)
+                return str(blob_client.url)
+
+            import asyncio as _asyncio
+            return await _asyncio.to_thread(_sync_upload)
+
         except Exception as e:
             logger.error(f"Error uploading file to blob storage: {str(e)}")
-            # Return a mock file URL as fallback
             file_extension = filename.split('.')[-1] if '.' in filename else 'pdf'
             mock_blob_name = f"{folder}/{conversation_id}/{uuid.uuid4()}.{file_extension}"
             mock_url = f"https://mock-storage.blob.core.windows.net/{self.settings.AZURE_STORAGE_CONTAINER_NAME}/{mock_blob_name}"
@@ -1560,47 +1554,44 @@ Create a detailed response with these sections:
                     "total_pages": 1,
                     "extraction_method": "fallback"
                 }
-            
-            # Analyze document using Azure Document Intelligence
-            poller = self.document_intelligence_processor.begin_analyze_document(
-                "prebuilt-document", file_content
-            )
-            result = poller.result()
-            
-            # Extract raw text
-            raw_text = ""
-            total_pages = len(result.pages)
-            for page in result.pages:
-                if hasattr(page, 'lines'):
-                    page_text = "\n".join([line.content for line in page.lines])
-                    raw_text += page_text + "\n"
-                elif hasattr(page, 'content'):
-                    raw_text += page.content + "\n"
-            
-            # Extract key-value pairs
-            key_value_pairs = {}
-            if hasattr(result, 'key_value_pairs') and result.key_value_pairs:
-                for kv_pair in result.key_value_pairs:
-                    if kv_pair.key and kv_pair.value:
-                        key_text = kv_pair.key.content.strip()
-                        value_text = kv_pair.value.content.strip()
-                        key_value_pairs[key_text] = value_text
-            
-            # Extract form fields
-            form_fields = {}
-            if hasattr(result, 'form_fields') and result.form_fields:
-                for field_name, field in result.form_fields.items():
-                    if field.value:
-                        form_fields[field_name] = field.value.content.strip()
-            
-            return {
-                "raw_text": raw_text,
-                "key_value_pairs": key_value_pairs,
-                "form_fields": form_fields,
-                "total_pages": total_pages,
-                "extraction_method": "azure_document_intelligence"
-            }
-            
+
+            # Run blocking Form Recognizer call in a worker thread
+            def _sync_analyze() -> Dict[str, Any]:
+                poller = self.document_intelligence_processor.begin_analyze_document(
+                    "prebuilt-document", file_content
+                )
+                result = poller.result()
+                raw_text = ""
+                total_pages = len(result.pages)
+                for page in result.pages:
+                    if hasattr(page, 'lines'):
+                        page_text = "\n".join([line.content for line in page.lines])
+                        raw_text += page_text + "\n"
+                    elif hasattr(page, 'content'):
+                        raw_text += page.content + "\n"
+                key_value_pairs = {}
+                if hasattr(result, 'key_value_pairs') and result.key_value_pairs:
+                    for kv_pair in result.key_value_pairs:
+                        if kv_pair.key and kv_pair.value:
+                            key_text = kv_pair.key.content.strip()
+                            value_text = kv_pair.value.content.strip()
+                            key_value_pairs[key_text] = value_text
+                form_fields = {}
+                if hasattr(result, 'form_fields') and result.form_fields:
+                    for field_name, field in result.form_fields.items():
+                        if getattr(field, 'value', None):
+                            form_fields[field_name] = field.value.content.strip()
+                return {
+                    "raw_text": raw_text,
+                    "key_value_pairs": key_value_pairs,
+                    "form_fields": form_fields,
+                    "total_pages": total_pages,
+                    "extraction_method": "azure_document_intelligence"
+                }
+
+            import asyncio as _asyncio
+            return await _asyncio.to_thread(_sync_analyze)
+
         except Exception as e:
             logger.error(f"Error extracting attachment content: {str(e)}")
             return {
