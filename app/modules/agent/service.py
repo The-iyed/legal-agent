@@ -28,7 +28,7 @@ from app.modules.claim_extractor.service import ClaimExtractorService
 from app.modules.claim_extractor.models import ExtractionResult, ProcessingStatus
 
 # Import response parser
-from app.modules.agent_kernel.utils.response_parser import clean_inline_source_markers, normalize_pleading_phrasing
+from app.modules.agent_kernel.utils.response_parser import clean_inline_source_markers, normalize_pleading_phrasing, enforce_arabic_ordinals_in_defense_sections
 
 logger = logging.getLogger(__name__)
 
@@ -2643,7 +2643,7 @@ Create a detailed response with these sections:
             if getattr(self, "openai_processor", None) and getattr(self, "azure_deployment_name", None) and claim_raw:
                 try:
                     system_prompt = (
-                        "أنت مساعد قانوني. من النص التالي (صحيفة الدعوى) استخرج المحكمة، رقم الدعوى، واسم المدعي." \
+                        "أنت مساعد قانوني. من النص التالي (صحيفة الدعوى) استخرج المحكمة، رقم الدعوى، واسم المدعي واسم المدعى عليه." \
                         " أعِد فقط الترويسة التالية بصيغة ماركداون وبالخط العريض (سطر لكل بند)، مع استبدال القيم المستخرجة،" \
                         " وإذا تعذر الاستخراج استعمل النقاط كما في القالب. لا تُرجع أي نص أو شرح إضافي ولا تستخدم كتل كود."
                     )
@@ -2655,7 +2655,7 @@ Create a detailed response with these sections:
                         "**مذكرة جوابية مقدمة من وزارة البلديات والإسكان**\n"
                         "**في الدعوى رقم ({رقم_الدعوى}) لعام 1447هـ**\n"
                         "**المدعي: {اسم_المدعي}**  \n"
-                        "**المدعى عليها: ----**\n\n"
+                        "**المدعى عليه: {اسم_المدعى_عليه}**\n\n"
                         "نص صحيفة الدعوى للتحليل:\n" + (claim_raw[:120000])
                     )
                     comp = self.openai_processor.chat.completions.create(
@@ -2679,28 +2679,44 @@ Create a detailed response with these sections:
                     logger.warning(f"LLM header generation failed; using fallback: {_e}")
                     header_text = ""
 
-            
+            # Deterministic bold fallback
             if not header_text:
                 case_number = (claim_doc or {}).get("case_number") or ""
                 plaintiff_name = (claim_doc or {}).get("plaintiff_name") or ""
                 court_name = (claim_doc or {}).get("court") or ""
+                defendant_name_val = (claim_doc or {}).get("defendant_name") or ""
                 cn = case_number.strip() if case_number.strip() else "....."
                 pl = plaintiff_name.strip() if plaintiff_name.strip() else "............................."
-                court = court_name.strip() if court_name.strip() else ".........."
+                court = (" " + court_name.strip()) if court_name.strip() else ""
+                dn = defendant_name_val.strip() if defendant_name_val.strip() else "----"
+                # Simple label selection: many government/corporate entities are treated with عليها; otherwise عليه
+                def_label = "المدعى عليه"
+                try:
+                    feminine_keywords = ["وزارة", "هيئة", "شركة", "مؤسسة", "أمانة", "بلدية", "جامعة"]
+                    if any(k in dn for k in feminine_keywords):
+                        def_label = "المدعى عليها"
+                except Exception:
+                    def_label = "المدعى عليه"
                 header_text = (
                     f"**فضيلة رئيس وأعضاء الدائرة ........ بالمحكمة الإدارية{court}           سلمهم الله**\n"
                     f"**السلام عليكم ورحمة الله وبركاته**\n"
-                    f"**مذكرة جوابية مقدمة من -----ن**\n"
+                    f"**مذكرة جوابية مقدمة من ----**\n"
                     f"**في الدعوى رقم ({cn}) لعام 1447هـ**\n"
                     f"**المدعي: {pl}**  \n"
-                    f"**المدعى عليها: -----ن**\n"
+                    f"**{def_label}: {dn}**\n"
                 )
 
             final_text = header_text + "\n\n" + cleaned_body.strip()
 
-            # Final phrasing normalization (does not touch spacing sequences)
+            # Final phrasing normalization (does not touch spacing sequences
             try:
                 final_text = normalize_pleading_phrasing(final_text)
+            except Exception:
+                pass
+
+            # Enforce Arabic ordinal enumeration under defense sections
+            try:
+                final_text = enforce_arabic_ordinals_in_defense_sections(final_text)
             except Exception:
                 pass
 
