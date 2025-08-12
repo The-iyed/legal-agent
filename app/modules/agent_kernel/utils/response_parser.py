@@ -239,87 +239,112 @@ def enforce_arabic_ordinals_in_defense_sections(text: str) -> str:
     Strategy:
     - Detect entry into either section when a line contains a header for it.
     - While inside the section, transform top-level bullet/numbered list lines to ordinal-prefixed lines.
+    - Also split inline occurrences like "أولاً: …؛ ثانياً: …" into separate lines.
+    - Use bold+underline formatting for ordinal labels via HTML: <u><strong>أولاً:</strong></u>.
     - Stop when another major section header is detected (الخلاصة، الطلبات، الوقائع، etc.).
-    - Leave lines already starting with an Arabic ordinal unchanged.
+    - Leave already formatted prefixes intact.
     """
     try:
         if not text:
             return text
-
+ 
         lines = text.splitlines()
-
+ 
         def is_section_header(line: str) -> bool:
             l = line.strip().replace("—", "-")
-            # Match possible forms like: "ثانياً: الدفع الشكلي", "الدفع الشكلي", etc.
             return (
                 bool(re.search(r"(?:^|\s)(الدفع\s+الشكلي)(?:\s*:|\s*$)", l)) or
                 bool(re.search(r"(?:^|\s)(الدفع\s+الموضوعي)(?:\s*:|\s*$)", l))
             )
-
+ 
         def is_next_major_section(line: str) -> bool:
             l = line.strip()
             if not l:
                 return False
-            # Do not treat other 'الدفع' lines as major section boundaries; headers are handled separately
             return any(k in l for k in [
                 "الخلاصة", "الطلبات", "الوقائع", "الوقائع:", "ملخص", "الملخص", "خاتمة"
             ])
-
+ 
         arabic_ordinals = [
             "أولاً", "ثانياً", "ثالثاً", "رابعاً", "خامساً",
             "سادساً", "سابعاً", "ثامناً", "تاسعاً", "عاشراً",
         ]
-
-        def line_has_arabic_ordinal_prefix(s: str) -> bool:
-            return bool(re.match(r"^\s*(أولاً|ثانياً|ثالثاً|رابعاً|خامساً|سادساً|سابعاً|ثامناً|تاسعاً|عاشراً)\s*:\s*", s))
-
+ 
+        ord_group = "|".join([re.escape(o) for o in arabic_ordinals])
+        start_prefix_re = re.compile(rf"^\s*((?:{ord_group})\s*:)\s*")
+        inline_prefix_re = re.compile(rf"[؛;،]\s*((?:{ord_group})\s*:)\s*")
+ 
+        def format_prefix(prefix: str) -> str:
+            p = prefix.strip()
+            # Bold + underline using HTML to guarantee underline rendering
+            return f"<u><strong>{p}</strong></u>"
+ 
         def leading_spaces(s: str) -> int:
             m = re.match(r"^(\s*)", s)
             return len(m.group(1)) if m else 0
-
+ 
         def is_top_level_bullet_like(s: str) -> bool:
-            # Accept common dash bullets and numeric bullets only if not indented (<= 1 space)
             if leading_spaces(s) > 1:
                 return False
             return bool(re.match(r"^\s*([\-•\*\u2013\u2014]|\d+[\)\.:]|[٠-٩]+[\)\.:])\s+", s))
-
+ 
+        output_lines: list[str] = []
         inside_defense_section = False
         ordinal_index = 0
-
-        for i, line in enumerate(lines):
+ 
+        for line in lines:
             stripped = line.strip()
-
-            # Always detect section headers
+ 
             if is_section_header(line):
                 inside_defense_section = True
                 ordinal_index = 0
-                lines[i] = stripped  # normalize header whitespace only
+                output_lines.append(stripped)
                 continue
-
+ 
             if inside_defense_section:
-                # If we hit another major (non-defense) section, stop enumerating
                 if is_next_major_section(line):
                     inside_defense_section = False
                     ordinal_index = 0
+                    output_lines.append(line)
                     continue
-
+ 
                 if not stripped:
+                    output_lines.append(line)
                     continue
-
-                # Skip if already ordinal-prefixed
-                if line_has_arabic_ordinal_prefix(line):
+ 
+                # Case A: inline ordinals in a single sentence (e.g., "أولاً: …؛ ثانياً: …")
+                if start_prefix_re.search(line) or inline_prefix_re.search(line):
+                    # Ensure first prefix is formatted at line start
+                    new_line = start_prefix_re.sub(lambda m: format_prefix(m.group(1)) + " ", line, count=1)
+                    # Split subsequent prefixes into newlines, each formatted
+                    new_line = inline_prefix_re.sub(lambda m: "\n" + format_prefix(m.group(1)) + " ", new_line)
+                    split_lines = new_line.split("\n")
+                    for sl in split_lines:
+                        output_lines.append(sl.rstrip())
                     continue
-
-                # Transform only top-level bullet/numbered lines to ordinal
+ 
+                # Case B: top-level bullets => convert to ordinal with formatting
                 if is_top_level_bullet_like(line):
-                    prefix = arabic_ordinals[ordinal_index] if ordinal_index < len(arabic_ordinals) else f"{ordinal_index+1}"
-                    # Remove common bullet markers before applying
+                    prefix_txt = arabic_ordinals[ordinal_index] if ordinal_index < len(arabic_ordinals) else f"{ordinal_index+1}"
                     content = re.sub(r"^\s*([\-•\*\u2013\u2014]|\d+[\)\.:]|[٠-٩]+[\)\.:])\s+", "", line).strip()
-                    lines[i] = f"{prefix}: {content}"
+                    output_lines.append(f"{format_prefix(prefix_txt + ':')} {content}")
                     ordinal_index += 1
                     continue
-
-        return "\n".join(lines)
+ 
+                # Case C: line already starts with ordinal but without bullets (ensure formatting)
+                if re.match(rf"^\s*(?:{ord_group})\s*:", line):
+                    output_lines.append(start_prefix_re.sub(lambda m: format_prefix(m.group(1)) + " ", line, count=1))
+                    ordinal_index += 1
+                    continue
+ 
+                # Otherwise, pass-through
+                output_lines.append(line)
+                continue
+ 
+            # Outside defense sections
+            output_lines.append(line)
+ 
+        return "\n".join(output_lines)
     except Exception as e:
         logger.warning(f"Failed to enforce Arabic ordinals: {e}")
         return text 
