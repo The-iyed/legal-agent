@@ -348,3 +348,118 @@ def enforce_arabic_ordinals_in_defense_sections(text: str) -> str:
     except Exception as e:
         logger.warning(f"Failed to enforce Arabic ordinals: {e}")
         return text 
+
+
+def enforce_defense_section_preamble(text: str) -> str:
+    """Ensure each defense section contains the required preamble pattern:
+    - After the header line, add an 'استنادًا إلى:' block listing relevant materials if missing
+    - Then add a line: 'ندفع بعدم قبول الدعوى شكلاً للأسباب التالية:' for procedural
+      or 'ندفع برد الدعوى موضوعًا للأسباب التالية:' for substantive when missing
+
+    We heuristically extract references from the section body by scanning for 'المادة (..)' phrases
+    and known anchors like 'جدول الغرامات'. If none found, we keep the section as-is.
+    """
+    try:
+        if not text:
+            return text
+
+        lines = text.splitlines()
+
+        def is_header(line: str, kind: str) -> bool:
+            l = line.strip()
+            if kind == "procedural":
+                return "الدفع الشكلي" in l
+            return "الدفع الموضوعي" in l
+
+        def is_section_break(line: str) -> bool:
+            l = line.strip()
+            if not l:
+                return False
+            return any(k in l for k in ["الخلاصة", "الطلبات"]) or ("الدفع" in l and ("الشكلي" in l or "الموضوعي" in l))
+
+        def collect_refs(section_lines: list[str]) -> list[str]:
+            refs: list[str] = []
+            import re as _re
+            joined = "\n".join(section_lines)
+            # Find 'المادة (xx) من ...' sequences
+            for m in _re.finditer(r"المادة\s*\([^)]+\)\s*من\s*[^\n،\.]+", joined):
+                ref = m.group(0).strip()
+                if not ref.endswith("،"):
+                    ref += "،"
+                refs.append(ref)
+                if len(refs) >= 4:
+                    break
+            # Add known anchors if present
+            if "جدول الغرامات" in joined and len(refs) < 5:
+                refs.append("جدول الغرامات والجزاءات البلدية،")
+            # De-duplicate preserving order
+            seen = set()
+            unique = []
+            for r in refs:
+                if r not in seen:
+                    unique.append(r)
+                    seen.add(r)
+            return unique
+
+        def insert_preamble(start_idx: int, end_idx: int, kind: str) -> tuple[int, int]:
+            # Build updated block with preamble if missing
+            block = lines[start_idx:end_idx]
+            block_str = "\n".join(block)
+            need_preamble = ("استنادًا" not in block_str and "استنادا" not in block_str)
+            need_decision_line = True
+            if kind == "procedural":
+                decision_line = "ندفع بعدم قبول الدعوى شكلاً للأسباب التالية:"
+                if "عدم قبول الدعوى" in block_str and "الأسباب التالية" in block_str:
+                    need_decision_line = False
+            else:
+                decision_line = "ندفع برد الدعوى موضوعًا للأسباب التالية:"
+                if ("رد الدعوى" in block_str or "رفض الدعوى" in block_str) and "الأسباب التالية" in block_str:
+                    need_decision_line = False
+
+            inserted = []
+            if need_preamble:
+                refs = collect_refs(block)
+                if refs:
+                    inserted.append("استنادًا إلى:")
+                    inserted.extend(refs)
+            if need_decision_line:
+                inserted.append(decision_line)
+
+            if inserted:
+                # Insert right after header (which is at start_idx)
+                # Preserve any blank line following header
+                header_line = lines[start_idx]
+                i = start_idx + 1
+                while i < end_idx and not lines[i].strip():
+                    i += 1
+                new_block = [header_line] + ([""] if (i == start_idx + 1 and lines[start_idx + 1].strip() == "") else []) + inserted + [""] + lines[i:end_idx]
+                lines[start_idx:end_idx] = new_block
+                # New end index after insertion
+                end_idx = start_idx + len(new_block)
+            return start_idx, end_idx
+
+        i = 0
+        n = len(lines)
+        while i < n:
+            if is_header(lines[i], "procedural"):
+                j = i + 1
+                while j < n and not is_section_break(lines[j]):
+                    j += 1
+                i, j = insert_preamble(i, j, "procedural")
+                n = len(lines)
+                i = j
+                continue
+            if is_header(lines[i], "substantive"):
+                j = i + 1
+                while j < n and not is_section_break(lines[j]):
+                    j += 1
+                i, j = insert_preamble(i, j, "substantive")
+                n = len(lines)
+                i = j
+                continue
+            i += 1
+
+        return "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"Failed to enforce defense preamble: {e}")
+        return text 

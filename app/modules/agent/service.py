@@ -28,7 +28,7 @@ from app.modules.claim_extractor.service import ClaimExtractorService
 from app.modules.claim_extractor.models import ExtractionResult, ProcessingStatus
 
 # Import response parser
-from app.modules.agent_kernel.utils.response_parser import clean_inline_source_markers, normalize_pleading_phrasing, enforce_arabic_ordinals_in_defense_sections
+from app.modules.agent_kernel.utils.response_parser import clean_inline_source_markers, normalize_pleading_phrasing, enforce_arabic_ordinals_in_defense_sections, enforce_defense_section_preamble
 
 logger = logging.getLogger(__name__)
 
@@ -2717,6 +2717,12 @@ Create a detailed response with these sections:
             # Enforce Arabic ordinal enumeration under defense sections
             try:
                 final_text = enforce_arabic_ordinals_in_defense_sections(final_text)
+            except Exception:
+                pass
+
+            # Ensure required preambles and decision lines are present in defense sections
+            try:
+                final_text = enforce_defense_section_preamble(final_text)
             except Exception:
                 pass
 
