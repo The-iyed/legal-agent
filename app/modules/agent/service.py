@@ -264,17 +264,17 @@ class AgentService:
                 except Exception as e:
                     logger.warning(f"Upload during cache hit failed, continuing with cached file_url: {e}")
                     file_url = cached_data.get("file_url")
-                # Update conversation status based on cached validity
+                    
                 is_valid_cached = bool(cached_data.get("is_valid", False) or (cached_data.get("is_valid") is True))
                 await self._update_conversation_status(
                     conversation_id,
                     ConversationStatus.CLAIM_DISCUSSION
                 )
-                # Build extracted fields object for metadata/UI (fallback)
+
                 ex_fields_cached = {k: cached_data.get(k) for k in [
                     "case_number", "case_subject", "case_type", "plaintiff_name", "defendant_name", "filing_date", "court"
                 ] if cached_data.get(k)}
-                # Also attempt to parse Arabic structured fields from cached response
+
                 kv_map_cached = {}
                 try:
                     for line in (cached_response or '').split('\n'):
@@ -742,8 +742,8 @@ class AgentService:
             blob_client = container_client.get_blob_client(blob_name)
             blob_client.upload_blob(file_content, overwrite=True)
             
-            # Return blob URL
-            return f"https://{self.settings.AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{self.settings.AZURE_STORAGE_CONTAINER_NAME}/{blob_name}"
+            # Return blob URL from SDK (avoids requiring account name in settings)
+            return str(blob_client.url)
             
         except Exception as e:
             logger.error(f"Error uploading file to blob storage: {str(e)}")
@@ -2609,3 +2609,56 @@ Create a detailed response with these sections:
         except Exception as e:
             logger.warning(f"_compose_conversation_title_desc_with_raw failed: {e}")
             return "دعوى جديدة", "نزاع بين طرفين"
+
+    async def _add_header_and_clean(self, body_text: str, claim_doc: Dict[str, Any]) -> str:
+        """Post-process a pleading body by adding a formal header from claim metadata and cleaning any citation artifacts.
+        - Uses a deterministic header template exactly as requested.
+        - Removes inline citation markers like 【...】, [doc_1], code fences from the body.
+        - Preserves header spacing and formatting.
+        """
+        try:
+            raw_body = body_text or ""
+            # Clean only the body first (remove inline sources and heavy artifacts), but don't collapse spaces that affect header
+            try:
+                cleaned_body = clean_inline_source_markers(raw_body)
+            except Exception:
+                cleaned_body = raw_body
+
+            # Also remove generic bracketed numeric citations like [1], [doc_3] and code fences from body
+            try:
+                import re as _re
+                cleaned_body = _re.sub(r"\[(?:doc_\d+|\d+)\]", "", cleaned_body)
+                cleaned_body = _re.sub(r"```[a-zA-Z]*\s*([\s\S]*?)```", r"\1", cleaned_body)
+                # Collapse excessive blank lines only in body
+                cleaned_body = _re.sub(r"\n{3,}", "\n\n", cleaned_body).strip()
+            except Exception:
+                pass
+
+            case_number = (claim_doc or {}).get("case_number") or ""
+            plaintiff_name = (claim_doc or {}).get("plaintiff_name") or ""
+
+            # Build exact header template with fallbacks for missing values
+            cn = case_number if case_number.strip() else "....."
+            pl = plaintiff_name if plaintiff_name.strip() else "............................."
+
+            header = (
+                "فضيلة رئيس وأعضاء الدائرة ........ بالمحكمة الإدارية..........           سلمهم الله\n"
+                "السلام عليكم ورحمة الله وبركاته\n"
+                "مذكرة جوابية مقدمة من وزارة البلديات والإسكان\n"
+                f"في الدعوى رقم ({cn}) لعام 1447هـ\n"
+                f"المدعي: {pl}  \n"
+                "المدعى عليها: وزارة البلديات والإسكان\n"
+            )
+
+            final_text = header + "\n" + cleaned_body.strip()
+
+            # Final phrasing normalization (does not touch spacing sequences)
+            try:
+                final_text = normalize_pleading_phrasing(final_text)
+            except Exception:
+                pass
+
+            return final_text
+        except Exception as e:
+            logger.warning(f"_add_header_and_clean failed, returning original body: {e}")
+            return (body_text or "").strip()

@@ -1404,24 +1404,6 @@ async def generate_legal_pleading(
         except Exception:
             pass
 
-        # Build a brief conversation context (last few agent lines that support the ministry)
-        conv_context = ""
-        try:
-            history = await agent_service.message_service.get_conversation_messages(conversation_id, page=1, page_size=200, sort_desc=True)
-            lines = []
-            if history and hasattr(history, 'messages'):
-                for m in history.messages:
-                    md = m.message_data.get("metadata", {}) if isinstance(m.message_data, dict) else {}
-                    if m.message_data.get("type") == "agent_response":
-                        txt = m.message_data.get("content", "")
-                        if txt:
-                            lines.append(txt[:500])
-                    if len(lines) >= 3:
-                        break
-            conv_context = "\n\n---\n".join(lines)
-        except Exception:
-            conv_context = ""
-
         # Build the analysis source from latest analyze or attachments-or-proceed messages
         latest_analysis = final_analysis or ""
         try:
@@ -1436,7 +1418,7 @@ async def generate_legal_pleading(
         except Exception:
             pass
 
-
+        # Pass 1: Generate BODY ONLY via Azure AI Projects Agent
         try:
             from azure.ai.projects import AIProjectClient
             from azure.identity import DefaultAzureCredential
@@ -1448,79 +1430,31 @@ async def generate_legal_pleading(
             )
             agent_obj = project.agents.get_agent(os.getenv("AZURE_AI_PROJECTS_AGENT_ID", "asst_Yr3GKYuAIBoma6rod05Xfs6l"))
             thread = project.agents.threads.create()
-            # Build header via HeaderAgent to avoid hallucination
-            try:
-                from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry
-                registry = AgentRegistry()
-                header_class = registry.get_agent_class("header")
-                header_agent = header_class(settings=agent_service.settings)
-                payload = {
-                    "court": (claim_doc or {}).get("court", "المحكمة الإدارية"),
-                    "case_number": case_number or "—",
-                    "year_h": "1447",
-                    "plaintiff_name": plaintiff_name or "—",
-                    "defendant_name": "وزارة البلديات والإسكان",
-                    "conversation_id": conversation_id,
-                }
-                import json as _json
-                header_filled = await header_agent._process_query([{"role": "user", "content": _json.dumps(payload, ensure_ascii=False)}])
-            except Exception:
-                _court = (claim_doc or {}).get("court", "المحكمة الإدارية")
-                _year_h = "1447"  # fallback
-                _plaintiff = plaintiff_name or (claim_doc or {}).get("plaintiff_name", "—")
-                _case_no = case_number or (claim_doc or {}).get("case_number", "—")
-                header_filled = (
-                    "رجاءً التزم بهذا القالب النهائي حرفيًا عند توليد المذكرة:\n\n"
-                    f"فضيلة رئيس وأعضاء الدائرة ........ بالمحكمة الإدارية {_court}           سلمهم الله\n"
-                    "السلام عليكم ورحمة الله وبركاته\n"
-                    "مذكرة جوابية مقدمة من وزارة البلديات والإسكان\n"
-                    f"في الدعوى رقم ({_case_no}) لعام {_year_h}هـ\n"
-                    f"المدعي: {_plaintiff}\n"
-                    "المدعى عليها: وزارة البلديات والإسكان\n"
-                )
-            composed_prompt = (
-                "THIS IS THE ANALYZE (latest):\n" + (latest_analysis or "غير متوفر") + "\n\n" +
-                "[CLAIM RAW TEXT]:\n" + (claim_text or "غير متوفر") + "\n\n" +
-                "THIS IS YOUR INSTRUCTIONS:\n" +
-                "أنت مساعد قانوني محترف وعبقري متخصص في أنظمة المرافعات السعودية، وتعمل وكأنك محامي مخضرم هدفه صياغة دفوع قوية تجعل المدعي يخسر الدعوى.\n\n"
-                "يجب أن تستند إجاباتك فقط على الوثائق التالية الموجودة في قاعدة المعرفة:\n- نظام المرافعات أمام ديوان المظالم ولائحته التنفيذية.\n- نظام المرافعات الشرعية ولوائحه التنفيذية.\n\n"
-                "إذا لم تجد الإجابة في هذه المستندات، قل حرفيًا: \"المعلومة غير متوفرة في المستندات المقدمة.\"\n\n"
-                "لا تستخدم أي مصادر خارجية أو معلومات قانونية غير موجودة في المستندات المرفوعة.\n\n---\n\n"
-                "## عند الرد على أي دعوى أو وقائع، يجب أن تقوم بما يلي:\n1. تحليل الدعوى وفق المستندات المرفوعة.\n2. تحديد المواد النظامية واللائحية ذات الصلة.\n3. صياغة دفع شكلي ودفع موضوعي معًا بأسلوب محامي محترف ومقنع.\n\n---\n\n"
-                "EXAMPLE OF STRUCTURE : ### أولًا: الدفع الشكلي\nالدفع الشكلي\nاستنادًا إلى المادة (5) من نظام المرافعات أمام ديوان المظالم، والمادة (3) من لائحته التنفيذية، وكذلك المادة (76) من نظام المرافعات الشرعية، والمادة (80) من لائحته التنفيذية، ندفع بعدم قبول الدعوى شكلاً، وذلك للأسباب التالية:\n\n- انتفاء الصفة النظامية للمدعي، إذ أن القلاب محل المخالفة لا تعود ملكيته له، وإنما هو مستأجر من قبل مقاول فرعي متعاقد ضمن مشروع حكومي، ولا يربط المدعي بالجهة المدعى عليها أي علاقة مباشرة أو نظامية تخوله صفة الخصومة.\n- عدم قيام المصلحة الشخصية المباشرة، حيث لم يُثبت المدعي وقوع ضرر نظامي مباشر عليه نتيجة القرار محل الدعوى، كما أن المخالفة تتعلق بإجراء تنظيمي لا يمس مركزه القانوني الخاص.\n- توجيه الدعوى إلى غير ذي صفة، فالقرار محل الاعتراض تم تحريره من قبل بلدية الشمال وفق صلاحياتها الرقابية والتنفيذية، وليس من أمانة منطقة الرياض بصفتها التنظيمية العليا، مما يفقد الدعوى شرط الاختصام الصحيح.\n\nوعليه، نلتمس الحكم بعدم قبول الدعوى لقيامها على غير ذي صفة.\n\n"
-                "### ثانيًا: الدفع الموضوعي\nالدفع الموضوعي\n[أدرج الأسباب مذكورة مع المادة ورقمها من النظام أو اللائحة].\n\n"
-                "---\n\n"
-                + header_filled +
-                "وقائع القضية (اكتب بصيغة مذكرة جوابية موجهة للرد على المدعي، وابدأ الجملة الافتتاحية بـ: 'تتلخص وقائع الدعوى ...' ولا تستخدم عبارة 'يتضح من' مطلقاً):\n"
-                ".................................................\n"
-                "............................................\n"
-                "..................................\n"
-                "الدفع الشكلي على الدعوى: (عدم قبول الدعوى أما لرفعها قبل أوانها أو عدم الصفة ، او انتفاء المصلحة أو سبق الفصل بها وغيرها من الدفوع الشكلية المعتبرة)\n"
-                "أولاً: ……………………………………………...\n"
-                "ثانياً: ……………………………………..\n"
-                "الدفع الموضوعي : إذا استلزم ذلك\n"
-                "أولاً: .................................\n"
-                "ثانياً: .................................\n\n"
-                "الخلاصة: …………………………………………...\n"
-                "الطلبات:\n"
-                "نطلب بعدم قبول الدعوى شكلاً ........................\n"
-                "رفض الدعوى موضوعاً..........................\n\n"
-                "                                                                                ممثل وزارة البلديات والإسكان\n"
-                "                                                                                 \n"
-                "                                                                 .................................\n"
-                "NOTE: DO NOT USE ANY 【...】 BLOCKS IN THE PLEADING. THIS IS VERY IMPORTANT."
+
+            body_only_prompt = (
+                "أنت محامٍ محترف تصيغ لائحة رد قانونية قوية باللغة العربية.\n"
+                "أنتج المحتوى فقط (دون أي ترويسة/عنوان في الأعلى)، وبالأقسام التالية إن وُجدت: وقائع القضية، الدفع الشكلي، الدفع الموضوعي، الخلاصة، الطلبات.\n"
+                "يُمنع كلياً إدراج أي مصادر أو أقواس مثل 【】 أو [1] أو [doc_1] أو أقسام SOURCES أو كتل كود.\n"
+                "عند الاستشهاد بمواد نظامية اكتفِ بذكر المادة ورقمها نصاً دون أي أقواس خاصة.\n"
+                "اعتمد فقط على هذه المدخلات:")
+            composed_input = (
+                body_only_prompt
+                + "\n\n[ANALYZE (latest)]:\n" + (latest_analysis or "غير متوفر")
+                + "\n\n[CLAIM RAW TEXT]:\n" + (claim_text or "غير متوفر")
+                + "\n\n[ATTACHMENTS TEXT]:\n" + (attachments_merged or "غير متوفر")
             )
-            project.agents.messages.create(thread_id=thread.id, role="user", content=composed_prompt)
+
+            project.agents.messages.create(thread_id=thread.id, role="user", content=composed_input)
             run = project.agents.runs.create_and_process(thread_id=thread.id, agent_id=agent_obj.id)
             if run.status == "failed":
                 raise HTTPException(status_code=500, detail=f"Pleading agent run failed: {run.last_error}")
             msgs = project.agents.messages.list(thread_id=thread.id, order=ListSortOrder.ASCENDING)
-            pleading = ""
+            pleading_body = ""
             for msg in msgs:
-                if msg.text_messages:
-                    pleading = msg.text_messages[-1].text.value
-            if not pleading:
-                pleading = "تعذر توليد لائحة الرد من العميل الذكي." 
+                if getattr(msg, "text_messages", None):
+                    pleading_body = msg.text_messages[-1].text.value
+            if not pleading_body:
+                pleading_body = "تعذر توليد نص لائحة الرد من عميل Azure." 
         except Exception as e:
             logger.warning(f"Azure AI Projects agent failed, falling back to SK agent: {e}")
             from app.modules.semantic_kernel.registry.agent_registry import AgentRegistry
@@ -1530,21 +1464,23 @@ async def generate_legal_pleading(
                 raise HTTPException(status_code=500, detail="LegalBasis agent not registered")
             agent = agent_class(settings=agent_service.settings)
             pleading_prompt = agent.prompt_manager.get_prompt("legal_basis", "pleading") or ""
-            pleading_prompt = pleading_prompt.replace("{{CONV_CONTEXT}}", conv_context)
+            pleading_prompt = pleading_prompt.replace("{{CONV_CONTEXT}}", "")
             pleading_prompt = pleading_prompt.replace("{{CLAIM_TEXT}}", claim_text or "").replace("{{ATTACHMENTS_TEXT}}", attachments_merged or "").replace("{{FINAL_ANALYSIS}}", latest_analysis or "").replace("{{CASE_NUMBER}}", case_number or "—").replace("{{PLAINTIFF_NAME}}", plaintiff_name or "—").replace("{{CLAIM_META}}", claim_meta or "").replace("{{ATTACHMENTS_META}}", attachments_meta or "")
-            pleading = await agent._process_query([{"role": "system", "content": pleading_prompt}])
+            pleading_body = await agent._process_query([{"role": "system", "content": pleading_prompt}])
 
+        # Pass 2: Add header and clean citations using Azure OpenAI (or deterministic fallback)
+        final_pleading = await agent_service._add_header_and_clean(pleading_body, claim_doc or {})
 
         stored_ok = False
         try:
             existing = await agent_service.message_service.collection.find_one({
                 "conversation_id": conversation_id,
                 "message_data.metadata.query_type": "pleading",
-                "message_data.content": pleading
+                "message_data.content": final_pleading
             })
             if not existing:
                 await agent_service._store_agent_message(
-                    pleading,
+                    final_pleading,
                     {"query_type": "pleading", "case_number": case_number},
                     conversation_id,
                     {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0}
@@ -1567,7 +1503,7 @@ async def generate_legal_pleading(
             pass
 
         # Provide follow-up notice
-        followup = "تم توليد لائحة الرد القانونية. أنا جاهز الآن للإجابة عن أي أسئلة تفصيلية تتعلق بالقضية ومرفقاتها وتحليلها النهائي."
+        followup = "تم توليد لائحة الرد القانونية بشكل منسق وخالٍ من المراجع. أنا جاهز الآن للإجابة عن أي أسئلة تفصيلية تتعلق بالقضية ومرفقاتها وتحليلها النهائي."
         await agent_service._store_agent_message(
             followup,
             {"query_type": "pleading_followup"},
@@ -1575,7 +1511,7 @@ async def generate_legal_pleading(
             {"agent_type": "chat", "prompt_type": "default", "confidence": 1.0}
         )
 
-        combined = pleading + "\n\n---\n" + followup
+        combined = final_pleading + "\n\n---\n" + followup
         return {"response": combined, "metadata": {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0, "stored_ok": stored_ok, "query_type": "pleading_response"}}
 
     except HTTPException:
