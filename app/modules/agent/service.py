@@ -28,7 +28,7 @@ from app.modules.claim_extractor.service import ClaimExtractorService
 from app.modules.claim_extractor.models import ExtractionResult, ProcessingStatus
 
 # Import response parser
-from app.modules.agent_kernel.utils.response_parser import clean_inline_source_markers, normalize_pleading_phrasing, enforce_arabic_ordinals_in_defense_sections, enforce_defense_section_preamble
+from app.modules.agent_kernel.utils.response_parser import clean_inline_source_markers, normalize_pleading_phrasing, enforce_arabic_ordinals_in_defense_sections, enforce_defense_section_preamble, normalize_defense_markdown_structure
 
 logger = logging.getLogger(__name__)
 
@@ -1681,14 +1681,13 @@ Create a detailed response with these sections:
             
             # Build comprehensive response
             parts = [
-                "✅ تم استلام ورفع مرفقاتك بنجاح.",
+                "تم رفع مرفقاتك بنجاح.",               
             ]
             if llm_overview:
                 parts.append("")
                 parts.append(llm_overview)
-            parts.append("")
-            parts.append(f"- تم حفظ النص المستخرج لكل مرفق ({len(attachment_results)}) وربطه بهذه المحادثة.")
-            parts.append("يمكنك الآن مناقشة المرفقات معي مباشرة أو رفع المزيد عند الحاجة.")
+   
+            
             response = "\n".join(parts)
             
             return response
@@ -2723,6 +2722,12 @@ Create a detailed response with these sections:
             # Ensure required preambles and decision lines are present in defense sections
             try:
                 final_text = enforce_defense_section_preamble(final_text)
+            except Exception:
+                pass
+
+            # Normalize markdown structure to headers and numeric lists
+            try:
+                final_text = normalize_defense_markdown_structure(final_text)
             except Exception:
                 pass
 

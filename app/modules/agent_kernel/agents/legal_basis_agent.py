@@ -47,6 +47,14 @@ class LegalBasisAgent(BaseAgent):
                 "- نقاط دفاع جديدة أو مُحسّنة للجهة البلدية.\n"
                 "اكتب بالعربية القانونية وبشكل مختصر، دون تكرار التحليل السابق، وميّز التحديث بعنوان واضح." 
             ),
+            "pleading_strict": (
+                "أنت محامٍ محترف. صِغ جسم لائحة الرد منظمًا على قسمين: الدفع الشكلي، الدفع الموضوعي.\n"
+                "اعتمد بشكل أساسي على التحليل النهائي ونص الدعوى؛ لا تستند إلى نص المرفقات الخام مباشرة.\n"
+                "- أدرِج جملة مرجعية نظامية ديناميكية قبل كل قسم تنتهي بعبارة ‘للأسباب التالية:’.\n"
+                "- اكتب الأسباب في سطور منفصلة تبدأ بـ: **أولاً:**، **ثانياً:**، **ثالثاً:** …\n"
+                "- لا تستخدم أقواس مراجع مربعة/أرقام، ولا تذكر مصادر تقنية.\n"
+                "[التحليل النهائي]\n{{FINAL_ANALYSIS}}\n\n[صحيفة الدعوى]\n{{CLAIM_TEXT}}"
+            ),
         }
 
     async def _process_query(self, messages: Optional[List[Dict[str, str]]] = None) -> str:
@@ -77,7 +85,7 @@ class LegalBasisAgent(BaseAgent):
         except Exception:
             pass
         prompt = (
-            prompt
+            (self.prompts.get("pleading_strict") or prompt)
             .replace("{{CLAIM_TEXT}}", claim_text or "")
             .replace("{{ATTACHMENTS_TEXT}}", attachments_text or "")
             .replace("{{FINAL_ANALYSIS}}", final_analysis or "")

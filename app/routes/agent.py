@@ -1420,6 +1420,7 @@ async def generate_legal_pleading(
 
         # Pass 1: Generate BODY ONLY via Azure AI Projects Agent
         try:
+            logger.info(f"[pleading] Start body generation via Azure agent | conv={conversation_id} case={case_number}")
             from azure.ai.projects import AIProjectClient
             from azure.identity import DefaultAzureCredential
             from azure.ai.agents.models import ListSortOrder
@@ -1433,10 +1434,11 @@ async def generate_legal_pleading(
 
             body_only_prompt = (
             "أنت محامٍ محترف تصيغ لائحة رد قانونية قوية باللغة العربية.\n"
-            "أنتج المحتوى فقط (دون أي ترويسة/عنوان في الأعلى)، وبالأقسام التالية إن وُجدت: وقائع القضية، الدفع الشكلي، الدفع الموضوعي، الخلاصة، الطلبات.\n"
+            "أنتج المحتوى فقط (دون أي ترويسة/عنوان في الأعلى) لقسمين لا غير: الدفع الشكلي، الدفع الموضوعي.\n"
             "اكتب نقاط قسمي «الدفع الشكلي» و«الدفع الموضوعي» بتعداد عربي نصي متسلسل بهذا الشكل: أولاً: … ثانياً: … ثالثاً: …؛ دون استخدام أرقام غربية أو شرطات. اجعل عناوين التعداد غامقة بصيغة ماركداون (**أولاً:**، **ثانياً:**) وافصل كل نقطة في سطر مستقل.\n"
-            "قبل تعداد نقاط «الدفع الشكلي» أدرِج سطراً مرجعياً مُركّباً ديناميكياً من المواد/المبادئ التي استُخدمت فعلاً في التحليل أو ظهرت في المرفقات (إن وُجدت) وينتهي بعبارة ‘للأسباب التالية:’. تجاوز هذا السطر إذا لم تتوافر مواد صالحة.\n"
-            "وقبل تعداد نقاط «الدفع الموضوعي» أدرِج سطراً مرجعياً مشابهاً مبنياً على المواد المستخدمة فعلاً وينتهي بعبارة ‘للأسباب التالية:’.\n"
+            "قبل تعداد نقاط «الدفع الشكلي» أدرِج سطراً مرجعياً مُركّباً ديناميكياً من المواد/المبادئ التي استُخدمت فعلاً في التحليل أو ظهرت في المرفقات (إن وُجدت) وينتهي بعبارة 'للأسباب التالية:' تجاوز هذا السطر إذا لم تتوافر مواد صالحة.\n"
+            "وقبل تعداد نقاط «الدفع الموضوعي» أدرِج سطراً مرجعياً مشابهاً مبنياً على المواد المستخدمة فعلاً وينتهي بعبارة 'للأسباب التالية:'.\n"
+            "لا تُدرج قسمي 'الخلاصة' أو 'الطلبات' ضمن هذا النص؛ سيتم توليدهما بواسطة عامل آخر لاحقاً.\n"
             "يُمنع كلياً إدراج أي مصادر أو أقواس مثل 【】 أو [1] أو [doc_1] أو أقسام SOURCES أو كتل كود.\n"
             "عند الاستشهاد بمواد نظامية اكتفِ بذكر المادة ورقمها نصاً دون أي أقواس خاصة.\n"
             "اعتمد فقط على هذه المدخلات:")
@@ -1444,7 +1446,6 @@ async def generate_legal_pleading(
                 body_only_prompt
                 + "\n\n[ANALYZE (latest)]:\n" + (latest_analysis or "غير متوفر")
                 + "\n\n[CLAIM RAW TEXT]:\n" + (claim_text or "غير متوفر")
-                + "\n\n[ATTACHMENTS TEXT]:\n" + (attachments_merged or "غير متوفر")
             )
 
             project.agents.messages.create(thread_id=thread.id, role="user", content=composed_input)
@@ -1456,6 +1457,14 @@ async def generate_legal_pleading(
             for msg in msgs:
                 if getattr(msg, "text_messages", None):
                     pleading_body = msg.text_messages[-1].text.value
+            logger.info(f"[pleading] Body generated via Azure | conv={conversation_id} len={len(pleading_body or '')}")
+            try:
+                _has_khitama = "الخلاصة" in (pleading_body or "")
+                _has_talabat = "الطلبات" in (pleading_body or "")
+                if _has_khitama or _has_talabat:
+                    logger.warning(f"[pleading] Azure body contains conclusion/requests markers | khitama={_has_khitama} talabat={_has_talabat}")
+            except Exception:
+                pass
             if not pleading_body:
                 pleading_body = "تعذر توليد نص لائحة الرد من عميل Azure." 
         except Exception as e:
@@ -1466,19 +1475,68 @@ async def generate_legal_pleading(
             if not agent_class:
                 raise HTTPException(status_code=500, detail="LegalBasis agent not registered")
             agent = agent_class(settings=agent_service.settings)
-            pleading_prompt = agent.prompt_manager.get_prompt("legal_basis", "pleading") or ""
-            pleading_prompt = pleading_prompt.replace("{{CONV_CONTEXT}}", "")
-            pleading_prompt = pleading_prompt.replace("{{CLAIM_TEXT}}", claim_text or "").replace("{{ATTACHMENTS_TEXT}}", attachments_merged or "").replace("{{FINAL_ANALYSIS}}", latest_analysis or "").replace("{{CASE_NUMBER}}", case_number or "—").replace("{{PLAINTIFF_NAME}}", plaintiff_name or "—").replace("{{CLAIM_META}}", claim_meta or "").replace("{{ATTACHMENTS_META}}", attachments_meta or "")
-            pleading_body = await agent._process_query([{"role": "system", "content": pleading_prompt}])
+            # Use strict SK generator that excludes conclusion/requests by design
+            pleading_body = await agent.generate_pleading(
+                claim_text or "",
+                attachments_merged or "",
+                latest_analysis or final_analysis or "",
+                case_number or "—",
+                plaintiff_name or "—"
+            )
+            logger.info(f"[pleading] Body generated via SK fallback | conv={conversation_id} len={len(pleading_body or '')}")
+            try:
+                _has_khitama = "الخلاصة" in (pleading_body or "")
+                _has_talabat = "الطلبات" in (pleading_body or "")
+                if _has_khitama or _has_talabat:
+                    logger.warning(f"[pleading] SK body contains conclusion/requests markers | khitama={_has_khitama} talabat={_has_talabat}")
+            except Exception:
+                pass
 
         # Pass 2: Add header and clean citations using Azure OpenAI (or deterministic fallback)
         final_pleading = await agent_service._add_header_and_clean(pleading_body, claim_doc or {})
+        logger.info(f"[pleading] Header+clean applied | conv={conversation_id} len={len(final_pleading or '')}")
+
+        # Pass 2.5: Refine body structure into strict markdown (without header)
+        try:
+            header_split = final_pleading.split("\n\n", 1)
+            header_part = header_split[0] if header_split else ""
+            body_part = header_split[1] if len(header_split) > 1 else final_pleading
+            from app.modules.agent_kernel.agents.pleading_refiner_agent import PleadingRefinerAgent
+            refiner = PleadingRefinerAgent(settings=agent_service.settings)
+            example_block = (
+                "ثانيًا: الدفع الشكلي\n"
+                "استنادًا إلى المواد الآتية:\n"
+                "المادة (5) من نظام المرافعات أمام ديوان المظالم،\n"
+                "المادة (76) من نظام المرافعات الشرعية،\n"
+                "المادة (80) من لائحته التنفيذية،\n"
+                "ندفع بعدم قبول الدعوى شكلاً للأسباب التالية:\n"
+                "انتفاء المصلحة المباشرة …\n"
+                "عدم وجود صفة نظامية للمدعي …\n"
+                "عدم تقديم ما يثبت العلم برفض التظلم …\n\n"
+                "ثالثًا: الدفع الموضوعي\n"
+                "استنادًا إلى:\n"
+                "المادة (2) من نظام المرافعات أمام ديوان المظالم،\n"
+                "المادة (32) من لائحته التنفيذية،\n"
+                "جدول الغرامات والجزاءات البلدية – مخالفة إلقاء مخلفات في الأراضي الفضاء دون تصريح،\n"
+                "ندفع برد الدعوى موضوعًا للأسباب التالية:\n"
+                "إلقاء المخلفات في أرض فضاء دون ترخيص …\n"
+                "المسؤولية عن المركبة تقع على المؤجر …\n"
+                "العقد المبرم لا يُعد إعفاء من المسؤولية …\n"
+                "تم إشعار المدعي بالمخالفة …\n"
+            )
+            refined_body = await refiner.refine(body_part, example=example_block)
+            # Recombine header + refined body
+            final_pleading = header_part.strip() + "\n\n" + refined_body.strip()
+            logger.info(f"[pleading] Body refined | conv={conversation_id} len={len(final_pleading or '')}")
+        except Exception as e:
+            logger.warning(f"PleadingRefinerAgent failed: {e}")
 
         # Pass 3: Generate خاتمة وطلبات via separate ConclusionAgent
         try:
             from app.modules.agent_kernel.agents.conclusion_agent import ConclusionAgent
             conclusion_agent = ConclusionAgent(settings=agent_service.settings)
             conclusion_text = await conclusion_agent.generate(latest_analysis or final_analysis or "", claim_text or "", attachments_merged or "")
+            logger.info(f"[pleading] Conclusion generated | conv={conversation_id} len={len(conclusion_text or '')} contains_khitama={'الخلاصة' in (conclusion_text or '')} contains_talabat={'الطلبات' in (conclusion_text or '')}")
         except Exception as e:
             logger.warning(f"ConclusionAgent failed: {e}")
             conclusion_text = "الخلاصة: …\n\nالطلبات:\n- عدم قبول الدعوى شكلاً (إن توافرت أسبابه)\n- رفض الدعوى موضوعاً"
@@ -1524,6 +1582,7 @@ async def generate_legal_pleading(
         )
 
         combined = final_pleading + "\n\n" + conclusion_text.strip() + "\n\n---\n" + followup
+        logger.info(f"[pleading] Combined ready | conv={conversation_id} total_len={len(combined or '')}")
         return {"response": combined, "metadata": {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0, "stored_ok": stored_ok, "query_type": "pleading_response"}}
 
     except HTTPException:

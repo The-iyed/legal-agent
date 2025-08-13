@@ -463,3 +463,67 @@ def enforce_defense_section_preamble(text: str) -> str:
     except Exception as e:
         logger.warning(f"Failed to enforce defense preamble: {e}")
         return text 
+
+
+def normalize_defense_markdown_structure(text: str) -> str:
+    """Standardize markdown structure:
+    - Convert section headers to '# ثانياً: الدفع الشكلي' and '# ثالثاً: الدفع الموضوعي'
+    - Convert ordinal/numbered/bulleted reasons into plain lines (no numbering), one reason per line
+    """
+    try:
+        if not text:
+            return text
+        lines = text.splitlines()
+
+        def is_header(line: str, kind: str) -> bool:
+            l = line.strip().lstrip('#').strip()
+            if kind == "procedural":
+                return "الدفع الشكلي" in l
+            return "الدفع الموضوعي" in l
+
+        def set_header_format(line: str, kind: str) -> str:
+            if kind == "procedural":
+                return "# ثانياً: الدفع الشكلي"
+            return "# ثالثاً: الدفع الموضوعي"
+
+        def is_section_break(line: str) -> bool:
+            l = line.strip()
+            return any(k in l for k in ["الخلاصة", "الطلبات"]) or ("الدفع" in l and ("الشكلي" in l or "الموضوعي" in l))
+
+        def strip_enumeration_prefixes(start: int, end: int) -> None:
+            import re as _re
+            for i in range(start, end):
+                s = lines[i]
+                original = s
+                # Remove bold ordinals like **أولاً:** or plain ordinals
+                s = _re.sub(r"^\s*\*\*(?:أولاً|ثانياً|ثالثاً|رابعاً|خامساً|سادساً|سابعاً|ثامناً|تاسعاً|عاشراً)\s*:\s*\*\*\s*", "", s)
+                s = _re.sub(r"^\s*(?:أولاً|ثانياً|ثالثاً|رابعاً|خامساً|سادساً|سابعاً|ثامناً|تاسعاً|عاشراً)\s*:\s*", "", s)
+                # Remove numeric or bullet prefixes: 1. , - , • , etc.
+                s = _re.sub(r"^\s*(?:\d+\.|[-•\*\u2013\u2014])\s+", "", s)
+                lines[i] = s.strip() if s.strip() else original
+
+        i = 0
+        n = len(lines)
+        while i < n:
+            if is_header(lines[i], "procedural"):
+                lines[i] = set_header_format(lines[i], "procedural")
+                j = i + 1
+                while j < n and not is_section_break(lines[j]):
+                    j += 1
+                strip_enumeration_prefixes(i + 1, j)
+                i = j
+                continue
+            if is_header(lines[i], "substantive"):
+                lines[i] = set_header_format(lines[i], "substantive")
+                j = i + 1
+                while j < n and not is_section_break(lines[j]):
+                    j += 1
+                strip_enumeration_prefixes(i + 1, j)
+                i = j
+                continue
+            i += 1
+
+        return "\n".join(lines)
+    except Exception as e:
+        logger.warning(f"Failed to normalize defense markdown structure: {e}")
+        return text 

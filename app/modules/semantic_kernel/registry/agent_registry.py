@@ -68,6 +68,11 @@ class AgentRegistry:
             "name": "Conclusion & Requests Generator",
             "description": "Generates الخلاصة and الطلبات sections from prior analysis and inputs"
         },
+        "pleading_refiner": {
+            "class": __import__("app.modules.agent_kernel.agents.pleading_refiner_agent", fromlist=["PleadingRefinerAgent"]).PleadingRefinerAgent,
+            "name": "Pleading Refiner",
+            "description": "Cleans and structures pleading body into strict two-section markdown"
+        },
         "phase_advisor": {
             "class": __import__("app.modules.agent_kernel.agents.phase_advisor_agent", fromlist=["PhaseAdvisorAgent"]).PhaseAdvisorAgent,
             "name": "Phase Advisor",
@@ -90,6 +95,7 @@ class AgentRegistry:
         "context_reformulator": ["default"],
         "legal_basis": ["extract_issues", "search_plan", "analysis", "defense", "update", "pleading"],
         "conclusion": ["conclusion"],
+        "pleading_refiner": ["pleading_refiner"],
         "phase_advisor": ["legal_basis_next_steps"],
         "header": ["default"],
     }
