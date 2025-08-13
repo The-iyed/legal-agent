@@ -1565,55 +1565,29 @@ async def generate_legal_pleading(
         except Exception:
             pass
 
-        stored_ok = False
-        try:
-            existing = await agent_service.message_service.collection.find_one({
-                "conversation_id": conversation_id,
-                "message_data.metadata.query_type": "pleading",
-                "message_data.content": final_pleading
-            })
-            if not existing:
-                await agent_service._store_agent_message(
-                    final_pleading,
-                    {"query_type": "pleading", "case_number": case_number},
-                    conversation_id,
-                    {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0}
-                )
-            stored_ok = True
-        except Exception:
-            stored_ok = False
+        # Do not store intermediate body-only message; only store the final combined result
+        stored_ok = False  # will be set True after storing the combined message
 
-        # Verify stored
-        stored_ok = False
-        try:
-            msgs = await agent_service.message_service.get_conversation_messages(conversation_id, page=1, page_size=50)
-            if msgs and hasattr(msgs, 'messages'):
-                for m in reversed(msgs.messages):
-                    md = m.message_data.get("metadata", {}) if isinstance(m.message_data, dict) else {}
-                    if md.get("query_type") == "pleading":
-                        stored_ok = True
-                        break
-        except Exception:
-            pass
-
-        # Provide follow-up notice
+        # Provide follow-up notice (skip storing empty follow-up)
         followup = ""
-        await agent_service._store_agent_message(
-            followup,
-            {"query_type": "pleading_followup"},
-            conversation_id,
-            {"agent_type": "chat", "prompt_type": "default", "confidence": 1.0}
-        )
+        if followup.strip():
+            await agent_service._store_agent_message(
+                followup,
+                {"query_type": "pleading_followup"},
+                conversation_id,
+                {"agent_type": "chat", "prompt_type": "default", "confidence": 1.0}
+            )
 
         combined = final_pleading + "\n\n" + conclusion_text.strip() + "\n\n---\n" + followup
         logger.info(f"[pleading] Combined ready | conv={conversation_id} total_len={len(combined or '')}")
         try:
             await agent_service._store_agent_message(
                 combined,
-                {"query_type": "pleading_full", "parts": {"body_len": len(final_pleading or ''), "conclusion_len": len(conclusion_text or '')}},
+                {"query_type": "pleading", "parts": {"body_len": len(final_pleading or ''), "conclusion_len": len(conclusion_text or '')}},
                 conversation_id,
-                {"agent_type": "legal_basis", "prompt_type": "pleading_full", "confidence": 1.0}
+                {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0}
             )
+            stored_ok = True
         except Exception as e:
             logger.warning(f"Failed to store combined pleading: {e}")
         return {"response": combined, "metadata": {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0, "stored_ok": stored_ok, "query_type": "pleading_response"}}
