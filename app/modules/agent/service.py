@@ -484,7 +484,6 @@ class AgentService:
                 attachment_results.append(data)
                 file_urls.append(url)
             
-            # Store a single aggregated message for all uploaded attachments
             try:
                 attachments_short = [
                     {"filename": a.get("filename"), "file_url": a.get("file_url"), "content_type": a.get("content_type"), "file_size": a.get("file_size")}
@@ -502,18 +501,15 @@ class AgentService:
             except Exception as e:
                 logger.warning(f"Failed to store aggregated attachments message: {e}")
             
-            # 3. Append attachments into the existing statement_of_claim document
             try:
                 await self._append_attachments_to_claim(conversation_id, attachment_results)
             except Exception as e:
                 logger.warning(f"Failed to append attachments to claim doc: {e}")
 
-            # 4. Generate concise overview response
             overview_response = await self._generate_attachment_overview_response(
                 claim_data, attachment_results, conversation_id
             )
             
-            # 4. Store agent response
             await self._store_agent_message(
                 overview_response,
                 {"query_type": "attachments", "attachments_processed": True, "count": len(files)},
@@ -521,9 +517,7 @@ class AgentService:
                 {"agent_type": "attachment_processor", "confidence": 0.95}
             )
             
-            # 5. Extract case number from original claim
             case_number = self._extract_case_number(claim_data)
-            # Build structured attachments list for client UI
             attachments_struct = [
                 {"name": a.get("filename"), "link": a.get("file_url"), "size": a.get("file_size")}
                 for a in attachment_results
