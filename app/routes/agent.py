@@ -1543,7 +1543,12 @@ async def generate_legal_pleading(
         try:
             from app.modules.agent_kernel.agents.conclusion_agent import ConclusionAgent
             conclusion_agent = ConclusionAgent(settings=agent_service.settings)
-            conclusion_text = await conclusion_agent.generate(latest_analysis or final_analysis or "", claim_text or "", attachments_merged or "")
+            conclusion_text = await conclusion_agent.generate(
+                latest_analysis or final_analysis or "",
+                claim_text or "",
+                attachments_merged or "",
+                body_text=refined_body or final_pleading
+            )
             logger.info(f"[pleading] Conclusion generated | conv={conversation_id} len={len(conclusion_text or '')} contains_khitama={'الخلاصة' in (conclusion_text or '')} contains_talabat={'الطلبات' in (conclusion_text or '')}")
         except Exception as e:
             logger.warning(f"ConclusionAgent failed: {e}")
