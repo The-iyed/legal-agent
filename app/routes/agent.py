@@ -1015,7 +1015,7 @@ async def request_attachments_or_proceed(
             # Move to legal basis phase
             await conversation_service.update_conversation_status(conversation_id, ConversationStatus.LEGAL_BASIS)
             content = (
-                "تم استلام تأكيدك. سننتقل الآن إلى مرحلة: تحليل القضايا القانونية وإعداد الاعتراضات، ثم مناقشة صياغة الوثائق القانونية."
+                "تم استلام تأكيدك. سننتقل الآن إلى مرحلة  التحليل، ثم مناقشة صياغة الوثائق القانونية."
             )
             await agent_service._store_agent_message(
                 content,
