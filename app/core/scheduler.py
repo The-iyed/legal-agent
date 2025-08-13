@@ -319,8 +319,17 @@ class TaskScheduler:
     def shutdown(self):
         """Shutdown the scheduler."""
         try:
-            self.scheduler.shutdown()
-            logger.info("🛑 Task scheduler shutdown successfully")
+            if getattr(self, "scheduler", None):
+                try:
+                    if self.scheduler.running:
+                        self.scheduler.shutdown(wait=False)
+                        logger.info("🛑 Task scheduler shutdown successfully")
+                    else:
+                        logger.info("🛑 Task scheduler not running; shutdown skipped")
+                except Exception as inner_e:
+                    logger.warning(f"Scheduler shutdown raised: {inner_e}")
+            else:
+                logger.info("🛑 No scheduler instance; shutdown skipped")
         except Exception as e:
             logger.error(f"❌ Error shutting down task scheduler: {str(e)}")
     

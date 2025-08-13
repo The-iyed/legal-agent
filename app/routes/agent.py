@@ -1524,7 +1524,15 @@ async def generate_legal_pleading(
                 "العقد المبرم لا يُعد إعفاء من المسؤولية …\n"
                 "تم إشعار المدعي بالمخالفة …\n"
             )
-            refined_body = await refiner.refine(body_part, example=example_block)
+            # Facts text source: prefer claim raw text, else minimal synthesis from body
+            facts_text = (claim_text or "").strip()
+            if not facts_text:
+                # Try to derive a minimal facts snippet from the body (first 3-4 sentences)
+                snippet = (body_part or "").strip()
+                parts = [p.strip() for p in snippet.split("\n") if p.strip()][:6]
+                facts_text = "\n".join(parts)
+            # Refine body with facts and example
+            refined_body = await refiner.refine(body_part, example=example_block, facts_text=facts_text)
             # Recombine header + refined body
             final_pleading = header_part.strip() + "\n\n" + refined_body.strip()
             logger.info(f"[pleading] Body refined | conv={conversation_id} len={len(final_pleading or '')}")
@@ -1540,6 +1548,22 @@ async def generate_legal_pleading(
         except Exception as e:
             logger.warning(f"ConclusionAgent failed: {e}")
             conclusion_text = "الخلاصة: …\n\nالطلبات:\n- عدم قبول الدعوى شكلاً (إن توافرت أسبابه)\n- رفض الدعوى موضوعاً"
+ 
+        # Enforce presence of both conclusion and requests blocks
+        try:
+            ct = (conclusion_text or "").strip()
+            added_blocks = []
+            if "الخلاصة" not in ct:
+                ct = ("الخلاصة: " + (ct if ct else "…")).strip()
+                added_blocks.append("khitama")
+            if "الطلبات" not in ct:
+                ct = ct.rstrip() + "\n\nالطلبات:\n- عدم قبول الدعوى شكلاً (إن توافرت أسبابه)\n- رفض الدعوى موضوعاً"
+                added_blocks.append("talabat")
+            if added_blocks:
+                logger.info(f"[pleading] Conclusion enforcement | conv={conversation_id} added={','.join(added_blocks)}")
+            conclusion_text = ct
+        except Exception:
+            pass
 
         stored_ok = False
         try:
@@ -1573,7 +1597,7 @@ async def generate_legal_pleading(
             pass
 
         # Provide follow-up notice
-        followup = "تم توليد لائحة الرد القانونية بشكل منسق وخالٍ من المراجع. أنا جاهز الآن للإجابة عن أي أسئلة تفصيلية تتعلق بالقضية ومرفقاتها وتحليلها النهائي."
+        followup = ""
         await agent_service._store_agent_message(
             followup,
             {"query_type": "pleading_followup"},
@@ -1583,6 +1607,15 @@ async def generate_legal_pleading(
 
         combined = final_pleading + "\n\n" + conclusion_text.strip() + "\n\n---\n" + followup
         logger.info(f"[pleading] Combined ready | conv={conversation_id} total_len={len(combined or '')}")
+        try:
+            await agent_service._store_agent_message(
+                combined,
+                {"query_type": "pleading_full", "parts": {"body_len": len(final_pleading or ''), "conclusion_len": len(conclusion_text or '')}},
+                conversation_id,
+                {"agent_type": "legal_basis", "prompt_type": "pleading_full", "confidence": 1.0}
+            )
+        except Exception as e:
+            logger.warning(f"Failed to store combined pleading: {e}")
         return {"response": combined, "metadata": {"agent_type": "legal_basis", "prompt_type": "pleading", "confidence": 1.0, "stored_ok": stored_ok, "query_type": "pleading_response"}}
 
     except HTTPException:

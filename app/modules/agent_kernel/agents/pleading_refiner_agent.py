@@ -45,8 +45,15 @@ class PleadingRefinerAgent(BaseAgent):
         )
         return completion.choices[0].message.content
 
-    async def refine(self, pleading_text: str, example: Optional[str] = None) -> str:
+    async def refine(self, pleading_text: str, example: Optional[str] = None, facts_text: Optional[str] = None) -> str:
         prompt = self.prompt.replace("{{PLEADING_TEXT}}", pleading_text or "")
+        # If facts are provided, instruct to prepend a '# أولاً: الوقائع' (2–4 lines) before the defenses
+        if facts_text:
+            prompt += (
+                "\n\nإذا توفر نص وقائع أدناه، فابدأ قبل أقسام الدفع بقسم بعنوان '# أولاً: الوقائع' يتكون من سطرين إلى أربعة أسطر،"
+                " يلخص الوقائع بوضوح دون أقواس تقنية أو تعداد: \n"
+                "[نص الوقائع]\n" + (facts_text[:4000])
+            )
         if example:
             prompt = (
                 prompt
