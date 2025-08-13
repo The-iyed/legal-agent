@@ -1181,7 +1181,7 @@ async def legal_basis_attachments_or_proceed(
                 async for a in cursor:
                     atts.append({"name": a.get("filename"), "link": a.get("file_url"), "size": a.get("file_size")})
                 names = ", ".join([a.get("name") or "(بدون اسم)" for a in atts])
-                content_agg = f"تم رفع المرفقات التالية: {names}"
+                content_agg = ""
                 await agent_service._store_agent_message(
                     content_agg,
                     {"type": "attachments_uploaded", "attachments": atts, "count": len(atts)},

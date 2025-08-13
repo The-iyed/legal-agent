@@ -491,7 +491,8 @@ class AgentService:
                     for a in attachment_results
                 ]
                 names_list = ", ".join([a.get("filename") or "(بدون اسم)" for a in attachment_results])
-                aggregate_content = f"تم رفع المرفقات التالية: {names_list}"
+                print(names_list)
+                aggregate_content = ""
                 await self._store_agent_message(
                     aggregate_content,
                     {"type": "attachments_uploaded", "attachments": attachments_short, "count": len(attachments_short)},
